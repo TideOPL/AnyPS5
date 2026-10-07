@@ -18,6 +18,7 @@ int APS5_VABI sceAjmInstanceDestroy(std::uint32_t, std::uint32_t);
 int APS5_VABI sceAjmBatchInitialize(void*, std::size_t, AjmBatchInfo*);
 int APS5_VABI sceAjmBatchJobInitialize(AjmBatchInfo*, std::uint32_t, const void*, std::size_t, void*);
 int APS5_VABI sceAjmBatchJobDecode(AjmBatchInfo*, std::uint32_t, const void*, std::size_t, void*, std::size_t, void*);
+int APS5_VABI sceAjmBatchJobDecodeSplit(AjmBatchInfo*, std::uint32_t, const AjmBuffer*, std::size_t, const AjmBuffer*, std::size_t, void*);
 int APS5_VABI sceAjmBatchJobDecodeSingle(AjmBatchInfo*, std::uint32_t, const void*, std::size_t, void*, std::size_t, void*);
 int APS5_VABI sceAjmBatchJobRun(AjmBatchInfo*, std::uint32_t, std::uint64_t, const void*, std::size_t, void*, std::size_t, void*, std::size_t);
 int APS5_VABI sceAjmBatchJobSetGaplessDecode(AjmBatchInfo*, std::uint32_t, const void*, int, void*);
@@ -351,6 +352,28 @@ bool Refused(std::uint32_t context, const AjmBatchInfo& info) {
         return true;
     }
     return false;
+}
+
+void TestDecodeSplit(std::uint32_t context) {
+    std::uint32_t whole = 0;
+    std::uint32_t split = 0;
+    Require(sceAjmInstanceCreate(context, 0, 0, &whole) == 0 && sceAjmInstanceCreate(context, 0, 0, &split) == 0);
+    std::vector<std::int16_t> reference(1152);
+    DecodeSideband expected{};
+    RunDecode(context, whole, MP3_MONO, sizeof(MP3_MONO), reference.data(), reference.size() * sizeof(std::int16_t), expected);
+    Require(expected.result == 0 && expected.outputWritten == 1152 * 2);
+    std::vector<std::int16_t> pcm(1152);
+    const AjmBuffer inputs[2] = {{const_cast<std::uint8_t*>(MP3_MONO), 40}, {const_cast<std::uint8_t*>(MP3_MONO) + 40, sizeof(MP3_MONO) - 40}};
+    const AjmBuffer outputs[2] = {{pcm.data(), 1000 * sizeof(std::int16_t)}, {pcm.data() + 1000, 152 * sizeof(std::int16_t)}};
+    std::vector<std::uint8_t> batch(4096);
+    AjmBatchInfo info{};
+    DecodeSideband sideband{};
+    Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+    Require(sceAjmBatchJobDecodeSplit(&info, split, inputs, 2, outputs, 2, &sideband) == 0);
+    Submit(context, info);
+    Require(sideband.result == expected.result && sideband.inputConsumed == expected.inputConsumed && sideband.outputWritten == expected.outputWritten && sideband.totalDecodedSamples == expected.totalDecodedSamples);
+    Require(pcm == reference);
+    Require(sceAjmInstanceDestroy(context, whole) == 0 && sceAjmInstanceDestroy(context, split) == 0);
 }
 
 void TestDecodeSingle(std::uint32_t context) {
@@ -913,6 +936,7 @@ int main() {
     TestMp3(context);
     TestOpus(context);
     TestDecodeSingle(context);
+    TestDecodeSplit(context);
     TestGaplessDecode(context);
     TestCodecInfo(context);
     TestGetInfo(context);
