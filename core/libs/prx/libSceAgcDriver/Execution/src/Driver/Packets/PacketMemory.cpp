@@ -138,6 +138,34 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
             }
         }
+        // A DMA_DATA of no bytes or to no destination (Unreal's CP_SYNC barriers) stores nothing and
+        // the queue already runs in order; a fill larger than gpuStoreLimit is a vkCmdFillBuffer.
+        // Both drained the device before, ~5000 times per 10 s at the Dungeons II title screen.
+        if (drained && opcode == 0x50 && packet.size() >= 7) {
+            const auto source = ((packet[1] >> 29u) & 3u) | ((packet[6] >> 24u) & 4u) | ((packet[6] >> 25u) & 8u);
+            const auto destination = ((packet[1] >> 20u) & 3u) | ((packet[6] >> 25u) & 4u) | ((packet[6] >> 26u) & 8u);
+            const std::size_t bytes = packet[6] & 0x3ffffffu;
+            if (bytes == 0 || destination == 2) {
+                orderedAlready = true;
+                drained = false;
+            } else if (source == 2 && (destination == 0 || destination == 3) && bytes % 4 == 0) {
+                const auto address = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+                if (address % 4 == 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes, true)) {
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    if (const auto localDevice = device.Load()) {
+                        Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "packet store", Graphics::PublishScope::PartialUnits);
+                        recordDeferredLabels(localDevice.get(), submission.queue);
+                        const std::array<std::uint32_t, 4> pattern{packet[2], packet[2], packet[2], packet[2]};
+                        if (localDevice->FillBuffer(address, bytes, pattern)) {
+                            ++storesOnGpu;
+                            wroteOnGpu = true;
+                            drained = false;
+                        }
+                    }
+                }
+            }
+        }
         if (drained && opcode == 0x50) {
             const auto copy = Pm4::DecodeMemoryCopy(packet);
             if (copy.has_value() && copy->bytes > gpuStoreLimit && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
