@@ -10,6 +10,8 @@
 #include <vector>
 
 namespace AgcDriver::Graphics {
+
+bool IntegerFormat(VkFormat format);
 namespace {
 
 struct Decoration {
@@ -534,7 +536,10 @@ std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders,
     std::set<std::uint32_t> locations;
     for (const auto& [location, signature] : previous.outputs) {
         if (location >= attachments) continue;
-        Require(signature == "vertex:f32x4", "fragment shader must export float4 colors to its attachments");
+        // A UINT16/SINT16 export (SPI_SHADER_COL_FORMAT 7/8) writes an integer target as uint4.
+        const auto color = std::find_if(state.colors.begin(), state.colors.end(), [&](const ColorTarget& target) { return target.exportIndex == location; });
+        const bool integerTarget = color != state.colors.end() && IntegerFormat(color->format);
+        Require(signature == "vertex:f32x4" || (integerTarget && signature == "vertex:u32x4"), "fragment shader must export float4 colors to its attachments");
         locations.insert(location);
     }
     return locations;
