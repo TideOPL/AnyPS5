@@ -130,9 +130,40 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     for (const auto& gone : evicted) destroy(gone);
 }
 
+std::size_t BufferPool::ReleaseRetained() noexcept {
+    std::vector<BufferAllocation> released;
+    std::size_t bytes = 0;
+    try {
+        std::lock_guard lock(mutex);
+        for (auto* tier : {&deviceTier, &largeTier, &smallTier}) {
+            for (const auto& [key, slots] : tier->free) {
+                for (const auto& slot : slots) {
+                    released.push_back(slot.allocation);
+                    bytes += slot.allocation.allocationBytes;
+                }
+            }
+            tier->evictions += tier->slots;
+            tier->free.clear();
+            tier->slots = 0;
+            tier->retainedBytes = 0;
+        }
+    } catch (...) {
+        return 0;
+    }
+    for (const auto& allocation : released) destroy(allocation);
+    return bytes;
+}
+
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context) {
     if (!context.bufferPool) context.bufferPool = std::make_shared<BufferPool>(context);
     return context.bufferPool;
+}
+
+VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& info, VkDeviceMemory* memory) {
+    const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
+    const auto result = allocate(context.device, &info, nullptr, memory);
+    if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY || !context.bufferPool || context.bufferPool->ReleaseRetained() == 0) return result;
+    return allocate(context.device, &info, nullptr, memory);
 }
 
 }

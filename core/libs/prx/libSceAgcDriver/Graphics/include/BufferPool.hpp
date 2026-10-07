@@ -58,6 +58,7 @@ public:
     static std::size_t Capacity(std::size_t bytes);
     std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void Put(const BufferAllocation& allocation) noexcept;
+    std::size_t ReleaseRetained() noexcept;
 
 private:
     struct Slot {
@@ -120,6 +121,7 @@ private:
 };
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context);
+VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& info, VkDeviceMemory* memory);
 
 }
 
