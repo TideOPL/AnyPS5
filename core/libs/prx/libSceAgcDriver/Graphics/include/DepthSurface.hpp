@@ -14,6 +14,8 @@ class Texture;
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
 void ClearDepthSurfaces(VkDevice device);
+// DBG: writes the depth plane of the surface at `address` as a census-style raw file.
+void DbgDumpDepthSurface(std::uint64_t address, const char* name);
 bool DepthSurfaceAt(std::uint64_t address);
 // Whether `address` is the stencil plane of a depth surface the DB renders (not its depth plane).
 bool DepthStencilPlaneAt(std::uint64_t address, std::uint32_t width, std::uint32_t height);

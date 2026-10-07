@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PassTrace.hpp"
+#include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -383,6 +385,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
         if (surface->context.device == context.device && sameSurface(surface->target, target)) {
+            if (PassTraceActive()) std::fprintf(stderr, "[pass]   depthsurf 0x%llx clear %g pending 0x%x htile 0x%llx\n", static_cast<unsigned long long>(target.address), target.clearDepth, surface->pendingClear, static_cast<unsigned long long>(target.htileAddress));
             surface->clearDepth = target.clearDepth;
             surface->clearStencil = target.clearStencil;
             surface->ApplyFastClear();
@@ -497,6 +500,7 @@ bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t addre
 }
 
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
+    if (PassTraceActive()) std::fprintf(stderr, "[pass]   htilefill 0x%llx +0x%llx pattern 0x%x\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), pattern);
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
         const auto& target = surface->target;
@@ -514,6 +518,37 @@ bool DepthSurfaceAt(std::uint64_t address) {
 bool DepthStencilPlaneAt(std::uint64_t address, std::uint32_t width, std::uint32_t height) {
     std::lock_guard lock(surfacesMutex());
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.stencilAddress != 0 && surface->target.stencilAddress == address && surface->target.address != address && surface->target.extent.width == width && surface->target.extent.height == height; });
+}
+
+}
+
+namespace AgcDriver::Graphics {
+
+void DbgDumpDepthSurface(std::uint64_t address, const char* name) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (surface->target.address != address) continue;
+        const auto& context = surface->context;
+        const bool d16 = surface->target.format == VK_FORMAT_D16_UNORM || surface->target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const std::uint32_t texel = d16 ? 2u : 4u;
+        const std::size_t bytes = static_cast<std::size_t>(surface->target.extent.width) * surface->target.extent.height * texel;
+        auto readback = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CommandBatch batch(context);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        copy.imageExtent = {surface->target.extent.width, surface->target.extent.height, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), surface->image, VK_IMAGE_LAYOUT_GENERAL, readback->Handle(), 1, &copy);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        if (std::FILE* file = std::fopen(name, "wb")) {
+            const std::uint32_t header[4] = {surface->target.extent.width, surface->target.extent.height, d16 ? 70u : 100u, texel};
+            std::fwrite(header, sizeof(header), 1, file);
+            std::fwrite(readback->Bytes().data(), 1, bytes, file);
+            std::fclose(file);
+        }
+        return;
+    }
 }
 
 }

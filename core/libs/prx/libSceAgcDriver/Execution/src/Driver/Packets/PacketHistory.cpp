@@ -18,9 +18,9 @@ void PacketHistory::Record(std::size_t offset) {
 std::string PacketHistory::Format(std::size_t offset) const {
     const auto header = commands[offset];
     const auto words = std::min(Pm4::PacketWords(header), commands.size() - offset);
-    char line[160];
+    char line[400];
     int length = std::snprintf(line, sizeof(line), "%s", Pm4::Name(header).c_str());
-    for (std::size_t i = 1; i < words && i < 9 && length < 140; ++i) length += std::snprintf(line + length, sizeof(line) - length, " %08x", commands[offset + i]);
+    for (std::size_t i = 1; i < words && i < 24 && length < 380; ++i) length += std::snprintf(line + length, sizeof(line) - length, " %08x", commands[offset + i]);
     return line;
 }
 

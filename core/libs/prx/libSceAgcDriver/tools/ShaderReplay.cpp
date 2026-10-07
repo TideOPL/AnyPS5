@@ -117,6 +117,17 @@ bool Replay(const char* path) {
         if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
+        for (const auto& attribute : result.vertexAttributes) {
+            const auto& f = attribute.resource.fields;
+            std::printf("  vertex attribute location %u: %u components, fetch %u, V# %08x %08x %08x %08x\n", attribute.location, attribute.components, attribute.fetchIndex, f[0], f[1], f[2], f[3]);
+        }
+        if (request.request.context.vertex) {
+            const auto& vertex = *request.request.context.vertex;
+            for (std::uint32_t i = 0; i < vertex.resourcesNum && i < ShaderRecompiler::ShaderVertexStageInfo::MaxResources; ++i) {
+                const auto& f = vertex.resources[i].fields;
+                std::printf("  vertex resource %u: V# %08x %08x %08x %08x\n", i, f[0], f[1], f[2], f[3]);
+            }
+        }
         if (g_spirv) {
             std::string name(path);
             name = name.substr(name.find_last_of("/\\") + 1) + ".spv";

@@ -5,6 +5,8 @@
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "SDL_vulkan.h"
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -37,8 +39,26 @@ void DisplayWindow::Ensure(std::uint32_t sourceWidth, std::uint32_t sourceHeight
 }
 
 void DisplayWindow::create(std::uint32_t sourceWidth, std::uint32_t sourceHeight) {
+    // DBG: DBG_WINDOW_DISPLAY=<index>|left opens the window on that display without taking focus.
+    int display = 0;
+    if (const char* chosen = std::getenv("DBG_WINDOW_DISPLAY")) {
+        if (std::strcmp(chosen, "left") == 0) {
+            int leftmost = 0;
+            for (int i = 0; i < SDL_GetNumVideoDisplays(); ++i) {
+                SDL_Rect bounds{};
+                if (SDL_GetDisplayBounds(i, &bounds) == 0 && bounds.x < leftmost) {
+                    leftmost = bounds.x;
+                    display = i;
+                }
+            }
+        } else {
+            display = std::atoi(chosen);
+        }
+        if (display < 0 || display >= SDL_GetNumVideoDisplays()) display = 0;
+        SDL_SetHint("SDL_WINDOW_NO_ACTIVATION_WHEN_SHOWN", "1");
+    }
     SDL_Rect usable{};
-    require(SDL_GetDisplayUsableBounds(0, &usable) == 0, SDL_GetError());
+    require(SDL_GetDisplayUsableBounds(display, &usable) == 0, SDL_GetError());
     require(DisplayWindowInitialSizePercent > 0 && DisplayWindowInitialSizePercent <= 100, "initial window size percent must be between 1 and 100");
     require(usable.w > 0 && usable.h > 0, "usable display extent must be positive");
     const auto boundsWidth = static_cast<std::uint32_t>(static_cast<std::uint64_t>(usable.w) * DisplayWindowInitialSizePercent / 100);
@@ -47,7 +67,7 @@ void DisplayWindow::create(std::uint32_t sourceWidth, std::uint32_t sourceHeight
     require(initialSize.width >= DisplayWindowMinimumWidth && initialSize.height >= DisplayWindowMinimumHeight, "initial window extent is smaller than the minimum");
     const auto title = GetAppTitle_nid_postfix();
     AgcDriverLockVulkanLoader_nid_postfix();
-    window = SDL_CreateWindow(title.value, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, static_cast<int>(initialSize.width), static_cast<int>(initialSize.height), SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    window = SDL_CreateWindow(title.value, static_cast<int>(SDL_WINDOWPOS_CENTERED_DISPLAY(display)), static_cast<int>(SDL_WINDOWPOS_CENTERED_DISPLAY(display)), static_cast<int>(initialSize.width), static_cast<int>(initialSize.height), SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     AgcDriverUnlockVulkanLoader_nid_postfix();
     require(window != nullptr, SDL_GetError());
     SDL_SetWindowMinimumSize(window, static_cast<int>(DisplayWindowMinimumWidth), static_cast<int>(DisplayWindowMinimumHeight));

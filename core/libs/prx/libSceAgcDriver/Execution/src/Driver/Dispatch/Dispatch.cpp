@@ -7,6 +7,8 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <cstdlib>
 #include <stdexcept>
+#include <thread>
+#include "prx/libSceAgcDriver/Graphics/include/PassTrace.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -39,6 +41,33 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         localDevice = device;
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
+    // DBG_DISPATCH_CODE=<hex address>: print the program's first 48 words and its user data, once.
+    if (static const std::uint64_t dbgCode = std::getenv("DBG_DISPATCH_CODE") ? std::strtoull(std::getenv("DBG_DISPATCH_CODE"), nullptr, 16) : 0; dbgCode == address) {
+        static std::atomic<int> printed{0};
+        if (printed.fetch_add(1) < 40) {
+            std::string line = std::string("[dispatch-code]") + " threads " + std::to_string(compute.numThreads[0]) + "x" + std::to_string(compute.numThreads[1]) + "x" + std::to_string(compute.numThreads[2]) + " code:";
+            char word[16];
+            for (std::size_t i = codeOffset; i < snapshot.code.size() && i < codeOffset + 48; ++i) {
+                std::snprintf(word, sizeof(word), " %08x", snapshot.code[i]);
+                line += word;
+            }
+            line += " user:";
+            for (const auto value : userData) {
+                std::snprintf(word, sizeof(word), " %08x", value);
+                line += word;
+            }
+            if (userData.size() >= 6) {
+                const auto valueAddress = userData[4] | (static_cast<std::uint64_t>(userData[5] & 0xffffu) << 32u);
+                std::snprintf(word, sizeof(word), " value %08x", *reinterpret_cast<const std::uint32_t*>(valueAddress));
+                line += word;
+                const auto base = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
+                char tail[64];
+                std::snprintf(tail, sizeof(tail), " base 0x%llx groups %u", static_cast<unsigned long long>(base), packet[1]);
+                line += tail;
+            }
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
+    }
     std::array<std::uint32_t, 5> resolved{};
     if (indirectArguments != 0 && (matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || matchesLoadedFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) {
 
@@ -251,6 +280,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             groups[axis] = (groups[axis] + threads - 1) / threads;
         }
     }
+    // DBG_CENSUS_AFTER_DISPATCH=<hex address>: a census of the traced images at the dispatch after
+    // the first traced dispatch of that program (so its results are in).
+    if (static const std::uint64_t censusAfter = std::getenv("DBG_CENSUS_AFTER_DISPATCH") ? std::strtoull(std::getenv("DBG_CENSUS_AFTER_DISPATCH"), nullptr, 16) : 0; censusAfter != 0) {
+        static std::atomic<int> state{0};
+        if (state.load() == 1) {
+            state = 2;
+            Graphics::DbgCensusRequested() = true;
+        } else if (state.load() == 0 && address == censusAfter && Graphics::PassTraceActive()) state = 1;
+    }
+    if (Graphics::PassTraceActive()) std::fprintf(stderr, "[pass] %lu dispatch 0x%llx queue 0x%x groups %ux%ux%u\n", static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 1000u), static_cast<unsigned long long>(address), submission.queue, groups[0], groups[1], groups[2]);
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
     if (traceIo) {
 

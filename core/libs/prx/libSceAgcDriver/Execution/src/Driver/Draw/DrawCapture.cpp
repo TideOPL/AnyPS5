@@ -5,6 +5,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
 #include <cstring>
+#include <thread>
+#include <algorithm>
+#include <string>
+#include <vector>
+#include "prx/libSceAgcDriver/Graphics/include/PassTrace.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -53,6 +58,69 @@ ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::u
         const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBefore, phaseMs[DrawRowCapture]);
         phaseMs[DrawRowCapture] -= waited;
         phaseMs[DrawRowCaptureHookWaits] += waited;
+    }
+    if (Graphics::PassTraceActive()) {
+        const auto name = dumpRequest(program.binary.codeAddress, request);
+        std::fprintf(stderr, "[pass] %lu   program %s stage %d\n", static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 1000u), name.c_str(), static_cast<int>(program.binary.stage));
+        // DBG_PEEK_CODE=<hex word>,...: for that program, the user data and 128 bytes at each user-data
+        // pair that reads as a mapped guest address (the low 48 bits, as s_load and V# bases use it).
+        static const std::vector<std::uint32_t> peekWords = [] {
+            std::vector<std::uint32_t> words;
+            if (const char* text = std::getenv("DBG_PEEK_CODE")) {
+                for (char* end = nullptr; *text != '\0'; text = *end == ',' ? end + 1 : end) {
+                    words.push_back(static_cast<std::uint32_t>(std::strtoul(text, &end, 16)));
+                    if (end == text) break;
+                }
+            }
+            return words;
+        }();
+        const auto& code = request.shader.code;
+        if (!peekWords.empty() && code.size() >= peekWords.size() && std::equal(peekWords.begin(), peekWords.end(), code.begin())) {
+            const auto& user = program.userData;
+            std::string line;
+            for (const auto word : user) {
+                char text[12];
+                std::snprintf(text, sizeof(text), " %08x", word);
+                line += text;
+            }
+            std::fprintf(stderr, "[peek] program %s first sgpr %u user%s\n", name.c_str(), program.firstUserSgpr, line.c_str());
+            // DBG_PEEK_ADDR=<hex>,...: 64 words at each of those addresses too.
+            if (const char* text = std::getenv("DBG_PEEK_ADDR")) {
+                for (char* end = nullptr; *text != '\0'; text = *end == ',' ? end + 1 : end) {
+                    const auto address = std::strtoull(text, &end, 16);
+                    if (end == text) break;
+                    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), 256)) continue;
+                    std::string words;
+                    for (std::size_t k = 0; k < 64; ++k) {
+                        char word[12];
+                        std::snprintf(word, sizeof(word), " %08x", reinterpret_cast<const std::uint32_t*>(address)[k]);
+                        words += word;
+                    }
+                    std::fprintf(stderr, "[peek]   addr 0x%llx:%s\n", static_cast<unsigned long long>(address), words.c_str());
+                }
+            }
+            for (std::size_t j = 0; j + 1 < user.size(); ++j) {
+                const auto address = user[j] | (static_cast<std::uint64_t>(user[j + 1] & 0xffffu) << 32u);
+                if (address < 0x100000000ull || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), 128)) continue;
+                std::string bytes;
+                for (std::size_t k = 0; k < 32; ++k) {
+                    char text[12];
+                    std::snprintf(text, sizeof(text), " %08x", reinterpret_cast<const std::uint32_t*>(address)[k]);
+                    bytes += text;
+                }
+                std::fprintf(stderr, "[peek]   user[%zu] 0x%llx:%s\n", j, static_cast<unsigned long long>(address), bytes.c_str());
+                std::lock_guard peekLock(Graphics::SubmitPeekMutex());
+                if (const auto found = Graphics::SubmitPeeks().find(address); found != Graphics::SubmitPeeks().end()) {
+                    std::string then;
+                    for (const auto word : found->second) {
+                        char text[12];
+                        std::snprintf(text, sizeof(text), " %08x", word);
+                        then += text;
+                    }
+                    std::fprintf(stderr, "[peek]   at submit 0x%llx:%s\n", static_cast<unsigned long long>(address), then.c_str());
+                }
+            }
+        }
     }
     if (dumpTarget != 0) {
 

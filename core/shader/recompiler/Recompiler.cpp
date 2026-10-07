@@ -92,6 +92,20 @@ ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
 }
 
 IrProgram PrepareResourceProgram(const RecompileRequest& request) {
+    DbgTranslatingCode() = request.shader.codeAddress;
+    // DBG: DBG_FORCE_EXPORT_CODE=<hex word>,<hex word>... marks a program by its first code words
+    // (shared code is translated once, under whichever address came first) as 0xf0f0f0f0f0.
+    static const std::vector<std::uint32_t> forceWords = [] {
+        std::vector<std::uint32_t> words;
+        if (const char* text = std::getenv("DBG_FORCE_EXPORT_CODE")) {
+            for (char* end = nullptr; *text != '\0'; text = *end == ',' ? end + 1 : end) {
+                words.push_back(static_cast<std::uint32_t>(std::strtoul(text, &end, 16)));
+                if (end == text) break;
+            }
+        }
+        return words;
+    }();
+    if (!forceWords.empty() && request.shader.code.size() >= forceWords.size() && std::equal(forceWords.begin(), forceWords.end(), request.shader.code.begin())) DbgTranslatingCode() = 0xf0f0f0f0f0ull;
     const auto stageKind = toShaderStageKind(request.shader.stage);
     const auto inputInfo = RequestInputInfo(request);
 

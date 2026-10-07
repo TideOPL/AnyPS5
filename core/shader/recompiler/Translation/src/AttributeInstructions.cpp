@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
+#include <cstdio>
+#include <utility>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -153,8 +156,35 @@ void TranslationContext::eXP(const RdnaInstruction& inst) {
     for (std::uint32_t source = 0u; source < sourceCount; ++source) {
         components[source] = &readRawU32(plainOperand(sourceAt(inst, source))).Value();
     }
+    // DBG: DBG_FORCE_EXPORT=<code address hex> exports magenta from every MRT of that program
+    // (DBG_FORCE_EXPORT_EXEC=1 also for every lane).
+    static const std::uint64_t forced = std::getenv("DBG_FORCE_EXPORT") ? std::strtoull(std::getenv("DBG_FORCE_EXPORT"), nullptr, 16) : 0ull;
+    std::uint32_t mrt = 0;
+    const bool force = forced != 0 && DbgTranslatingCode() == forced && exportTargetKindFromTarget(inst.exportTarget, mrt) == ExportTargetKind::Mrt;
+    // DBG_FORCE_POS_ZW=1: with a matched program, its POS0 export keeps x/y and writes z 0.5, w 1.
+    static const bool forcePosZw = std::getenv("DBG_FORCE_POS_ZW") != nullptr;
+    if (forcePosZw && forced != 0 && DbgTranslatingCode() == forced && inst.exportTarget == 12u && !inst.exportIsCompressed) {
+        std::fprintf(stderr, "[dbg-force] program 0x%llx POS0 z/w forced\n", static_cast<unsigned long long>(forced));
+        components[2] = &ir.Constant(0x3f000000u);
+        components[3] = &ir.Constant(0x3f800000u);
+    }
+    if (force) {
+        std::fprintf(stderr, "[dbg-force] program 0x%llx MRT%u export forced to magenta (compressed %d)\n", static_cast<unsigned long long>(forced), mrt, inst.exportIsCompressed ? 1 : 0);
+        // OR'd into the computed values so nothing the shader computed becomes dead (replacing them
+        // let dead-code removal drop image reads the resource plan still names).
+        const std::array<std::uint32_t, 4> magenta = inst.exportIsCompressed ? std::array<std::uint32_t, 4>{0x00003c00u, 0x3c003c00u, 0u, 0u} : std::array<std::uint32_t, 4>{0x3f800000u, 0u, 0x3f800000u, 0x3f800000u};
+        static const bool exportUv = std::getenv("DBG_FORCE_EXPORT_UV") != nullptr;
+        if (exportUv) {
+            // The raw bits of interpolated attribute 0: a compressed export shows each float's top
+            // half as G/A (about 1-2 for a coordinate in (0, 1), exactly 0 for 0).
+            components[0] = &ir.Emit(IrOpcode::GetAttribute, IrType::U32, {&ir.Constant(0u), &ir.Constant(0u)});
+        } else {
+            for (std::size_t i = 0; i < 4; ++i) components[i] = &ir.Emit(IrOpcode::BitwiseOr32, IrType::U32, {components[i], &ir.Constant(magenta[i])});
+        }
+    }
     IrValue& data = ir.Emit(IrOpcode::CompositeConstructU32x4, IrType::U32x4, {components[0], components[1], components[2], components[3]});
-    IrValue& exec = ir.GetExec();
+    static const bool forceExec = std::getenv("DBG_FORCE_EXPORT_EXEC") != nullptr;
+    IrValue& exec = force && forceExec ? ir.ConstantBool(true) : ir.GetExec();
     (void)ir.Emit(IrOpcode::SetAttribute, IrType::Void, {&data, &exec}, addExportInfo(inst));
 }
 

@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
+#include <thread>
+#include "prx/libSceAgcDriver/Graphics/include/PassTrace.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -238,6 +240,30 @@ void Driver::execute(const Submission& submission) {
                 static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
                 static const bool profileDraws = std::getenv("APS5_PROFILE_DRAW") != nullptr;
                 const auto color = (static_cast<std::uint64_t>(readRegister(queue.context, 0x390)) << 40u) | (static_cast<std::uint64_t>(readRegister(queue.context, 0x318)) << 8u);
+                if (Graphics::PassTraceActive()) {
+                    const auto mask = readRegister(queue.context, 0x8e);
+                    std::string slots;
+                    for (std::uint32_t slot = 0; slot < 8; ++slot) {
+                        if (((mask >> (slot * 4u)) & 0xfu) == 0) continue;
+                        const auto base = (static_cast<std::uint64_t>(readRegister(queue.context, 0x390 + slot)) << 40u) | (static_cast<std::uint64_t>(readRegister(queue.context, 0x318 + slot * 0xfu)) << 8u);
+                        Graphics::PassTraceNote(base);
+                        char text[40];
+                        std::snprintf(text, sizeof(text), " c%u 0x%llx", slot, static_cast<unsigned long long>(base));
+                        slots += text;
+                    }
+                    std::fprintf(stderr, "[pass] %lu draw %s queue 0x%x mask 0x%x%s\n", static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 1000u), Pm4::Name(header).c_str(), submission.queue, mask, slots.c_str());
+                    if (mask == 0xffu) recent.Print(stderr, "[pass-pkt] %s\n");
+                    static int drawDumps = 0;
+                    char regsName[64];
+                    std::snprintf(regsName, sizeof(regsName), "passdraw_%04d.regs", drawDumps++);
+                    if (std::FILE* file = std::fopen(regsName, "w")) {
+                        std::fprintf(file, "# %s mask 0x%x%s\n", Pm4::Name(header).c_str(), mask, slots.c_str());
+                        for (const auto& [offset, value] : queue.context) std::fprintf(file, "context %x %08x\n", offset, value);
+                        for (const auto& [offset, value] : queue.userConfig) std::fprintf(file, "uconfig %x %08x\n", offset, value);
+                        for (const auto& [offset, value] : queue.shader) std::fprintf(file, "shader %x %08x\n", offset, value);
+                        std::fclose(file);
+                    }
+                }
                 const auto started = profileDraws ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 const auto countSkip = [&](Graphics::DrawSkip kind) {
                     if (profileDraws) Graphics::CountDrawSkip(kind, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count());

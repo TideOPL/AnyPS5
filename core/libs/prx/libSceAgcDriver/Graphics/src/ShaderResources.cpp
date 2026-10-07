@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PassTrace.hpp"
+#include <thread>
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -510,6 +512,7 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
 void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
+    if (PassTraceActive()) std::fprintf(stderr, "[pass] evict 0x%llx %ux%u vk%d %p\n", static_cast<unsigned long long>(it->texture->Descriptor().baseAddress), it->texture->Descriptor().width, it->texture->Descriptor().height, static_cast<int>(it->texture->StorageFormat()), static_cast<const void*>(it->texture.get()));
     it->texture->SetCached(false);
     it->texture->Flush();
     cache.bytes -= it->texture->GuestBytes();
@@ -581,6 +584,63 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     return texture;
 }
 
+// DBG: DBG_STORAGE_CENSUS_S=<seconds> saves, once, mip 0 / layer 0 of every cached 2D storage image
+// at least 256 texels wide as census_<rank>_<address>_<w>x<h>_vk<format>.raw (u32 w, h, VkFormat,
+// u32 bytes per texel, then rows), most recently used first.
+void storageCensus(const Context& context, StorageTextureCache& cache) {
+    static const double after = std::getenv("DBG_STORAGE_CENSUS_S") ? std::atof(std::getenv("DBG_STORAGE_CENSUS_S")) : -1.0;
+    static const auto started = std::chrono::steady_clock::now();
+    static bool done = false;
+    const bool requested = DbgCensusRequested().exchange(false);
+    if (!requested && (after < 0 || done || std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() < after)) return;
+    done = true;
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Sync();
+    int rank = 0;
+    for (const auto& entry : cache.entries) {
+        const auto& texture = *entry.texture;
+        const auto& descriptor = texture.Descriptor();
+        // DBG_CENSUS_ADDRS=<hex>,<hex>...: only those addresses (any size), past the 80 cap.
+        static const std::string only = std::getenv("DBG_CENSUS_ADDRS") ? std::string(",") + std::getenv("DBG_CENSUS_ADDRS") + "," : std::string();
+        static const bool traced = std::getenv("DBG_CENSUS_TRACED") != nullptr;
+        if (traced) {
+            std::lock_guard traceLock(PassTraceMutex());
+            if (!PassTraceAddresses().contains(descriptor.baseAddress) || texture.Image() == VK_NULL_HANDLE || (descriptor.dimension != TextureDimension::k2D && descriptor.dimension != TextureDimension::k3D)) continue;
+        } else if (!only.empty()) {
+            char key[32];
+            std::snprintf(key, sizeof(key), ",%llx,", static_cast<unsigned long long>(descriptor.baseAddress));
+            if (only.find(key) == std::string::npos || texture.Image() == VK_NULL_HANDLE || descriptor.dimension != TextureDimension::k2D) continue;
+        } else if (texture.Image() == VK_NULL_HANDLE || descriptor.width < 256 || descriptor.dimension != TextureDimension::k2D) continue;
+        const auto elementBytes = BytesPerElement(descriptor.format);
+        if (elementBytes == 0 || elementBytes > 16) continue;
+        const std::size_t bytes = static_cast<std::size_t>(descriptor.width) * descriptor.height * elementBytes;
+        auto readback = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CommandBatch batch(context);
+        VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {descriptor.width, descriptor.height, 1};
+        context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(batch.Handle(), texture.Image(), VK_IMAGE_LAYOUT_GENERAL, readback->Handle(), 1, &copy);
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+        batch.SubmitAndWait();
+        char name[128];
+        std::snprintf(name, sizeof(name), "census_%03d_%llx_%ux%u_vk%d.raw", rank++, static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, static_cast<int>(texture.StorageFormat()));
+        if (std::FILE* file = std::fopen(name, "wb")) {
+            const std::uint32_t header[4] = {descriptor.width, descriptor.height, static_cast<std::uint32_t>(texture.StorageFormat()), elementBytes};
+            std::fwrite(header, sizeof(header), 1, file);
+            std::fwrite(readback->Bytes().data(), 1, bytes, file);
+            std::fclose(file);
+        }
+        if (rank >= 400) break;
+    }
+    std::fprintf(stderr, "[census] saved %d storage images\n", rank);
+}
+
 std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled) return std::make_shared<StorageTexture>(context, *context.detiler, viewed, mip);
@@ -593,6 +653,7 @@ std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std
     const StorageKey key{context.device, SurfaceKey(context, resource)};
     auto& cache = StorageTextures();
     std::lock_guard lock(cache.mutex);
+    storageCensus(context, cache);
     if (resource.mipCount > AllocatedLevels(resource)) {
         auto allocated = resource;
         allocated.mipCount = AllocatedLevels(resource);
@@ -626,6 +687,7 @@ std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std
     while (!cache.entries.empty() && cache.bytes + entry.texture->GuestBytes() > budget) evictStorage(cache, std::prev(cache.entries.end()));
     cache.bytes += entry.texture->GuestBytes();
     auto texture = entry.texture;
+    if (PassTraceActive()) std::fprintf(stderr, "[pass] create 0x%llx %ux%u vk%d dcc 0x%llx %p\n", static_cast<unsigned long long>(texture->Descriptor().baseAddress), texture->Descriptor().width, texture->Descriptor().height, static_cast<int>(texture->StorageFormat()), static_cast<unsigned long long>(texture->Descriptor().dccAddress), static_cast<const void*>(texture.get()));
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
     cache.byImage[texture.get()] = cache.entries.begin();
@@ -947,6 +1009,13 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                         // vector) counts as written, like imageWritten below.
                         const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
                         const bool atomic = element < binding.bufferAtomic.size() && binding.bufferAtomic[element];
+                        if (written && PassTraceActive()) {
+                            const auto* v = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4;
+                            const auto base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xffffu) << 32u);
+                            const auto stride = (v[1] >> 16u) & 0x3fffu;
+                            const auto bytes = stride != 0 ? static_cast<std::uint64_t>(v[2]) * stride : static_cast<std::uint64_t>(v[2]);
+                            if (bytes >= (256u << 10u)) std::fprintf(stderr, "[pass] %lu   wbuf  0x%llx +0x%llx stride %u\n", static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 1000u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), stride);
+                        }
                         const auto index = addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic);
                         const auto& push = shader.program->pushConstants;
                         if (!push.empty()) {
@@ -2380,6 +2449,17 @@ void ShaderResources::PrecollectSurfaces() const {
 
 void ShaderResources::addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags) {
     Require(binding.count != 0, "empty descriptor binding");
+    if (PassTraceActive() && (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage || binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) && binding.guestDescriptor.size() % binding.count == 0) {
+        const auto elementWords = binding.guestDescriptor.size() / binding.count;
+        for (std::uint32_t element = 0; element < binding.count && elementWords >= 4; ++element) {
+            try {
+                const auto resource = DecodeTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords));
+                PassTraceNote(resource.baseAddress);
+                std::fprintf(stderr, "[pass] %lu   %s 0x%llx %ux%u fmt %u dim %d mips %u-%u\n", static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 1000u), binding.kind == ShaderRecompiler::DescriptorKind::StorageImage ? "write" : "read ", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), resource.baseLevel, resource.lastLevel);
+            } catch (...) {
+            }
+        }
+    }
     if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
         // Storage images are guest textures the shader writes (looked up in stage B).
         Require(binding.role == ShaderRecompiler::DescriptorRole::GuestImages, "storage image binding has a non-image role");

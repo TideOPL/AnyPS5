@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <bit>
 #include <cstdlib>
+#include <cstring>
+#include "prx/libSceAgcDriver/Graphics/include/PassTrace.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -202,6 +204,24 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         GuestMemory::CheckRange(descriptor.addr, static_cast<std::size_t>(descriptor.dw_num) * sizeof(std::uint32_t), alignof(std::uint32_t));
         copyCommands(submission, descriptor.addr, descriptor.dw_num);
     }
+    static const bool peekSubmit = std::getenv("DBG_PEEK_SUBMIT") != nullptr;
+    if (peekSubmit) {
+        const auto& commands = submission.commands;
+        for (std::size_t cursor = 0; cursor < commands.size();) {
+            const auto header = commands[cursor];
+            const auto words = std::max<std::size_t>(1, Pm4::PacketWords(header));
+            if ((header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x76u && cursor + 12 < commands.size() && commands[cursor + 1] == 0x8cu && words >= 12) {
+                const auto address = commands[cursor + 10] | (static_cast<std::uint64_t>(commands[cursor + 11] & 0xffffu) << 32u);
+                if (address > 0x100000000ull && GuestMemory::Accessible(reinterpret_cast<const void*>(address), 128)) {
+                    std::array<std::uint32_t, 32> snapshot{};
+                    std::memcpy(snapshot.data(), reinterpret_cast<const void*>(address), sizeof(snapshot));
+                    std::lock_guard lock(Graphics::SubmitPeekMutex());
+                    Graphics::SubmitPeeks()[address] = snapshot;
+                }
+            }
+            cursor += words;
+        }
+    }
     const auto copied = profile ? std::chrono::steady_clock::now() : start;
     validate(submission, descriptor.addr);
     readRegisterLists(submission);
@@ -230,6 +250,16 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         ++accepted;
     }
     changed.notify_all();
+    // DBG: DBG_WAIT_SUBMIT=1 holds the submitting thread until queue 0's submission ran (2 s at
+    // most), so the title cannot run ahead and reuse memory its queued commands still read.
+    static const bool waitSubmit = std::getenv("DBG_WAIT_SUBMIT") != nullptr;
+    if (waitSubmit && queue == 0 && !onWorkerThread()) {
+        std::unique_lock lock(mutex);
+        const auto serial = accepted;
+        ++idleWaiters;
+        changed.wait_for(lock, std::chrono::seconds(2), [&] { return failure != nullptr || stopping || completed >= serial || completedOutOfOrder.contains(serial); });
+        --idleWaiters;
+    }
 }
 
 void Driver::SuspendPoint() {

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PassTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -1498,7 +1499,6 @@ std::optional<State> maskedState(const State& state, const std::set<std::uint32_
 
 // Debug aid: APS5_DUMP_TARGETS=<n> saves the first n renders of every color target as a raw file
 // (u32 width, u32 height, u32 VkFormat, then tightly packed rows).
-int DumpTargetLimit() {
 // The framebuffer's layers: every color view of a layered draw covers the same slice count (Vulkan
 // renders a layer index beyond an attachment's views nowhere, so the smallest count is the bound).
 std::uint32_t ColorLayers(const State& state) {
@@ -1507,6 +1507,7 @@ std::uint32_t ColorLayers(const State& state) {
     return std::max(layers, 1u);
 }
 
+int DumpTargetLimit() {
     static const int dumpLimit = [] { const char* text = std::getenv("APS5_DUMP_TARGETS"); return text ? std::atoi(text) : 0; }();
     return dumpLimit;
 }
@@ -1551,6 +1552,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     double ownWaitedMs = 0;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    if (PassTraceActive()) {
+        std::fprintf(stderr, "[pass]   depth %s 0x%llx vk%d test %d write %d op %d bounds %d [%g,%g] stencil %d op %d/%d/%d cmp %d ref %u mask 0x%x/0x%x\n", state.depth ? "on" : "off", static_cast<unsigned long long>(state.depth ? state.depth->address : 0), state.depth ? static_cast<int>(state.depth->format) : 0, state.depthTest, state.depthWrite, static_cast<int>(state.depthCompare), state.depthBoundsTest, state.minDepthBounds, state.maxDepthBounds, state.stencilTest, static_cast<int>(state.stencilFront.failOp), static_cast<int>(state.stencilFront.passOp), static_cast<int>(state.stencilFront.depthFailOp), static_cast<int>(state.stencilFront.compareOp), state.stencilFront.reference, state.stencilFront.compareMask, state.stencilFront.writeMask);
+        for (std::size_t index = 0; index < state.colors.size() && index < state.blends.size(); ++index) {
+            const auto& b = state.blends[index];
+            std::fprintf(stderr, "[pass]   blend %zu 0x%llx vk%d en %u c %d/%d op %d a %d/%d op %d mask 0x%x count %u inst %u\n", index, static_cast<unsigned long long>(state.colors[index].address), static_cast<int>(state.colors[index].format), b.blendEnable, b.srcColorBlendFactor, b.dstColorBlendFactor, b.colorBlendOp, b.srcAlphaBlendFactor, b.dstAlphaBlendFactor, b.alphaBlendOp, b.colorWriteMask, draw.indexCount, draw.instanceCount);
+        }
+    }
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -1608,6 +1616,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             });
         }
         if (binding.resident != nullptr) {
+            if (PassTraceActive()) std::fprintf(stderr, "[pass]   target %zu 0x%llx %ux%u dcc 0x%llx -> image %p\n", index, static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.dccAddress), static_cast<const void*>(binding.resident.get()));
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
             targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layerCount));
@@ -1787,6 +1796,64 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, ColorLayers(state));
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
+    // DBG: within the pass trace, the first draw into two color targets has its first target
+    // read back right after it ran (afterdraw_<address>.raw, the census format).
+    const auto dumpAfterDraw = [&] {
+        // DBG_PREPASS_DUMP_MAX=<n>: dump the depth plane after the first n depth-writing draws without color targets (at least 1920 wide) in the trace window.
+        static const int prepassMax = std::getenv("DBG_PREPASS_DUMP_MAX") ? std::atoi(std::getenv("DBG_PREPASS_DUMP_MAX")) : 0;
+        static int prepassDumped = 0;
+        if (PassTraceActive() && prepassDumped < prepassMax && state.colors.empty() && state.depth && state.depthWrite && state.depth->extent.width >= 1920) {
+            ++prepassDumped;
+            if (recorder != nullptr) recorder->Sync();
+            char depthName[96];
+            std::snprintf(depthName, sizeof(depthName), "prepass_%03d_%llx_n%u_i%u.raw", prepassDumped, static_cast<unsigned long long>(state.depth->address), draw.indexCount, draw.instanceCount);
+            DbgDumpDepthSurface(state.depth->address, depthName);
+            std::fprintf(stderr, "[pass] prepass dump %s\n", depthName);
+        }
+        // DBG_AFTERDRAW_VK=<VkFormat> / DBG_AFTERDRAW_MAX=<n>: dump target 0 after the first n draws of that format in the trace window.
+        static const int afterDrawFormat = std::getenv("DBG_AFTERDRAW_VK") ? std::atoi(std::getenv("DBG_AFTERDRAW_VK")) : static_cast<int>(VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+        static const int afterDrawMax = std::getenv("DBG_AFTERDRAW_MAX") ? std::atoi(std::getenv("DBG_AFTERDRAW_MAX")) : 1;
+        static const std::size_t afterDrawTargets = std::getenv("DBG_AFTERDRAW_VK") ? 1u : 2u;
+        static const std::size_t afterDrawSlot = std::getenv("DBG_AFTERDRAW_SLOT") ? std::strtoull(std::getenv("DBG_AFTERDRAW_SLOT"), nullptr, 10) : 0u;
+        static int afterDrawDumped = 0;
+        if (PassTraceActive() && afterDrawDumped < afterDrawMax && targets.size() > afterDrawSlot && targets.size() >= afterDrawTargets && targets[afterDrawSlot].resident != nullptr && static_cast<int>(targets[afterDrawSlot].resident->StorageFormat()) == afterDrawFormat) {
+            ++afterDrawDumped;
+            if (recorder != nullptr) recorder->Sync();
+            auto& image = *targets[afterDrawSlot].resident;
+            const auto& descriptor = image.Descriptor();
+            const auto elementBytes = BytesPerElement(descriptor.format);
+            const std::size_t bytes = static_cast<std::size_t>(descriptor.width) * descriptor.height * elementBytes;
+            auto readback = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            CommandBatch batch(context);
+            VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {descriptor.width, descriptor.height, 1};
+            context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(batch.Handle(), image.Image(), VK_IMAGE_LAYOUT_GENERAL, readback->Handle(), 1, &copy);
+            VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+            batch.SubmitAndWait();
+            char name[96];
+            std::snprintf(name, sizeof(name), "afterdraw_%03d_%llx_%ux%u_vk%d.raw", afterDrawDumped, static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, static_cast<int>(image.StorageFormat()));
+            if (std::FILE* file = std::fopen(name, "wb")) {
+                const std::uint32_t header[4] = {descriptor.width, descriptor.height, static_cast<std::uint32_t>(image.StorageFormat()), elementBytes};
+                std::fwrite(header, sizeof(header), 1, file);
+                std::fwrite(readback->Bytes().data(), 1, bytes, file);
+                std::fclose(file);
+            }
+            std::fprintf(stderr, "[pass] after-draw dump %s (%s)\n", name, recorded ? "recorded" : "synchronous");
+            if (afterDrawTargets == 2u) DbgCensusRequested() = true;
+            if (std::getenv("DBG_AFTERDRAW_DEPTH") != nullptr && state.depth) {
+                std::snprintf(name, sizeof(name), "afterdepth_%03d_%llx_%ux%u.raw", afterDrawDumped, static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height);
+                DbgDumpDepthSurface(state.depth->address, name);
+            }
+        }
+    };
     if (lean) {
         RecordedDraw record;
         record.recorder = recorder;
@@ -1834,6 +1901,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             *recipeOut = std::move(recipe);
         }
         timing.Mark("draw_and_resource_release");
+        dumpAfterDraw();
         report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
         return;
     }
@@ -1988,6 +2056,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (recorded) {
         keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, std::move(scratch), std::move(checkRecords), listed, completion, outcome);
         timer.phase(PhaseKeep);
+        dumpAfterDraw();
         if (outcome.waited) {
             // The wait the dispatch path makes for such work (source 3, "address-based"): the
             // write-back runs before the next packet, so the CPU never reads copied results or
@@ -2008,6 +2077,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (profile) ownWaitedMs += Recorder::ThreadWaitedMs() - ownBefore;
     }
     if (checkRecords) checkRecords();
+    dumpAfterDraw();
     timer.phase(PhaseSync);
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait OK");
     for (const auto& binding : targets) GuestMemory::CheckRange(reinterpret_cast<const void*>(binding.color.address), binding.color.bytes, 256, true);
@@ -2032,6 +2102,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.resident != nullptr) {
             // The results stay on the GPU until something reads the target's memory.
             binding.resident->MarkDirty();
+            static const bool residentDccMark = std::getenv("DBG_RESIDENT_DCC_MARK") != nullptr;
+            if (residentDccMark && binding.color.dccAddress != 0) MarkDccUncompressed(binding.color.dccAddress, ColorTargetLayout(binding.color.extent.width, binding.color.extent.height, binding.color.tileMode, binding.color.elementBytes).Bytes());
             continue;
         }
         if (binding.gpuTiling) GuestMemory::WriteChanged(binding.color.address, binding.tiled->Bytes(), binding.original);
@@ -2095,6 +2167,12 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (!RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == state.colors.size(), "draw recipe targets do not match the state");
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe);
+    if (PassTraceActive()) {
+        for (std::size_t index = 0; index < state.colors.size() && index < state.blends.size(); ++index) {
+            const auto& b = state.blends[index];
+            std::fprintf(stderr, "[pass]   blend %zu 0x%llx vk%d en %u c %d/%d op %d a %d/%d op %d mask 0x%x count %u inst %u (recipe)\n", index, static_cast<unsigned long long>(state.colors[index].address), static_cast<int>(state.colors[index].format), b.blendEnable, b.srcColorBlendFactor, b.dstColorBlendFactor, b.colorBlendOp, b.srcAlphaBlendFactor, b.dstAlphaBlendFactor, b.alphaBlendOp, b.colorWriteMask, draw.indexCount, draw.instanceCount);
+        }
+    }
     if (inputs.nothing) {
         result.recorded = true;
         return result;

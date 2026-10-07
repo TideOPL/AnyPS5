@@ -437,6 +437,11 @@ struct ResourceCapture;
 // cache keys on it.
 void SetDebugProbeActive(bool active);
 [[nodiscard]] bool DebugProbeActive();
+// DBG: the code address of the program being translated on this thread (for DBG_FORCE_EXPORT).
+inline std::uint64_t& DbgTranslatingCode() {
+    thread_local std::uint64_t address = 0;
+    return address;
+}
 [[nodiscard]] bool RayTracingStrict();
 [[nodiscard]] bool RayTracingMiss();
 
