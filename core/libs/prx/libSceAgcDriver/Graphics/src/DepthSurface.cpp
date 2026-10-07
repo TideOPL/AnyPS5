@@ -118,12 +118,20 @@ public:
     const StorageTexture* seeded = nullptr;
     std::uint32_t writerLayer = 0;
 
-    void Transfer(StorageTexture& storage, bool into, std::uint32_t layer) {
+    // Unreal aliases transient resources, so a storage image at a depth surface's address with another shape reuses that memory rather than viewing the depth surface.
+    bool Accepts(const StorageTexture& storage, std::uint32_t layer) const {
         const auto& descriptor = storage.Descriptor();
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto storageFormat = storage.StorageFormat();
         const bool sized = d16 ? (storageFormat == VK_FORMAT_R16_UINT || storageFormat == VK_FORMAT_R16_UNORM || storageFormat == VK_FORMAT_R16_SINT || storageFormat == VK_FORMAT_R16_SNORM || storageFormat == VK_FORMAT_R16_SFLOAT) : (storageFormat == VK_FORMAT_R32_SFLOAT || storageFormat == VK_FORMAT_R32_UINT || storageFormat == VK_FORMAT_R32_SINT);
-        if (!sized || descriptor.width != target.extent.width || descriptor.height != target.extent.height || descriptor.mipCount != 1 || (descriptor.dimension != TextureDimension::k2D && descriptor.dimension != TextureDimension::k2DArray) || (layer != 0 && layer > descriptor.depthOrLastArray)) {
+        return sized && descriptor.width == target.extent.width && descriptor.height == target.extent.height && descriptor.mipCount == 1 && (descriptor.dimension == TextureDimension::k2D || descriptor.dimension == TextureDimension::k2DArray) && (layer == 0 || layer <= descriptor.depthOrLastArray);
+    }
+
+    void Transfer(StorageTexture& storage, bool into, std::uint32_t layer) {
+        const auto& descriptor = storage.Descriptor();
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const auto storageFormat = storage.StorageFormat();
+        if (!Accepts(storage, layer)) {
             char text[256];
             std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u image of vk format %d, dimension %d, %u mips is not implemented", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), descriptor.width, descriptor.height, static_cast<int>(storageFormat), static_cast<int>(descriptor.dimension), descriptor.mipCount);
             throw std::runtime_error(text);
@@ -409,6 +417,12 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         return surface->context.device == context.device && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
     });
     if (found == list.rend()) return nullptr;
+    if (resource.width != (*found)->target.extent.width || resource.height != (*found)->target.extent.height) return nullptr; // memory reuse, see Accepts
+    {
+        const auto viewed = ResolveTextureFormat(resource.format);
+        const bool eightBit = viewed == VK_FORMAT_R8_UNORM || viewed == VK_FORMAT_R8_SNORM || viewed == VK_FORMAT_R8_UINT || viewed == VK_FORMAT_R8_SINT || viewed == VK_FORMAT_R8_SRGB;
+        if (eightBit && resource.baseAddress == (*found)->target.address) return nullptr; // no depth plane is 8 bits wide, so this is memory reuse too
+    }
     (*found)->ApplyFastClear();
     (*found)->TakeWrites();
     const auto& base = (*found)->target;
@@ -459,6 +473,7 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
         const auto slice = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->context.device == context.device && surface->target.address == address && surface->target.extent.width == base.extent.width && surface->target.extent.height == base.extent.height && surface->target.format == base.format; });
         if (slice == list.rend()) continue;
         auto& surface = **slice;
+        if (!surface.Accepts(*storage, layer)) continue;
         if (surface.seeded == storage.get() && surface.writerLayer == layer && surface.writer.lock() == storage) continue;
         surface.ApplyFastClear();
         surface.TakeWrites();
@@ -496,9 +511,9 @@ bool DepthSurfaceAt(std::uint64_t address) {
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.address == address || surface->target.stencilAddress == address; });
 }
 
-bool DepthStencilPlaneAt(std::uint64_t address) {
+bool DepthStencilPlaneAt(std::uint64_t address, std::uint32_t width, std::uint32_t height) {
     std::lock_guard lock(surfacesMutex());
-    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.stencilAddress != 0 && surface->target.stencilAddress == address && surface->target.address != address; });
+    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.stencilAddress != 0 && surface->target.stencilAddress == address && surface->target.address != address && surface->target.extent.width == width && surface->target.extent.height == height; });
 }
 
 }
