@@ -59,6 +59,7 @@ static constexpr int VIDEO_OUT_BUFFER_NUM_MAX = 16;
 static constexpr int VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX = 4;
 static constexpr int VIDEO_OUT_NUM_MAX = 4;
 static constexpr std::size_t VIDEO_OUT_FLIP_QUEUE_CAPACITY = 16;
+static constexpr std::size_t VIDEO_OUT_GPU_FLIP_DEPTH = 2;
 
 static constexpr int VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED = 0;
 static constexpr int VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED = 1;

@@ -63,7 +63,7 @@ public:
     void WaitForFlipRoom() override {
         std::unique_lock queueLock(queue->mutex);
         const bool room = queue->changed.wait_for(queueLock, std::chrono::seconds(60), [&] {
-            return queue->failure || queue->stopping || cfg->shutdownToken.stop_requested() || queue->reservations.load() < VIDEO_OUT_FLIP_QUEUE_CAPACITY;
+            return queue->failure || queue->stopping || cfg->shutdownToken.stop_requested() || queue->reservations.load() < VIDEO_OUT_GPU_FLIP_DEPTH;
         });
         if (queue->failure) std::rethrow_exception(queue->failure);
         if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
