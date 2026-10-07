@@ -3,6 +3,7 @@
 #include "IntermediateRepresentation/IrValue.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
+#include <cstdlib>
 #include <initializer_list>
 #include <string>
 #include <vector>
@@ -560,6 +561,13 @@ std::uint32_t EmitReadLane(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const IrValue* selector = inst.Argument(1)->Resolve();
     if (selector != nullptr && selector->HasImmediate() && HostSubgroupNarrowerThanWave(state)) {
         const auto index = selector->ImmediateU32() & (state.program.WaveSize() - 1u);
+        // A 32-lane host subgroup running a wave64 vertex program stands for a wave whose upper half
+        // was never launched (its ballots carry no high word). Unreal's wave64 vertex shaders read
+        // lanes 31 and 63 to add the two halves' totals of a reduction whose unlaunched lanes
+        // contribute 0, so a lane of the upper half reads 0. APS5_STRICT_READLANE=1 refuses it.
+        static const bool strict = std::getenv("APS5_STRICT_READLANE") != nullptr;
+        const bool unlaunchedHalf = !strict && state.program.Resources().stage == IrShaderStage::Vertex && state.hostSubgroupSize == 32u && index >= 32u;
+        if (unlaunchedHalf) return ConstantU32(state, 0u);
         if (index >= state.hostSubgroupSize) FailOutsideHostSubgroup(ctx, inst, "v_readlane_b32 of lane " + std::to_string(index));
     }
     const auto lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, state.program.WaveSize() - 1u));
