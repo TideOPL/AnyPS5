@@ -24,6 +24,18 @@ bool Driver::matchesFillKernel(std::span<const std::uint32_t> code, const std::v
     return type == 0 && stride == 16 && !swizzled && !addTid && dstSel == 0xfacu && format == 0x4bu;
 }
 
+bool Driver::matchesLoadedFillKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
+    static const bool enabled = std::getenv("APS5_NO_FILL_HLE") == nullptr;
+    if (!enabled || userData.size() < 6 || compute.numThreads[0] != 64 || compute.numThreads[1] != 1 || compute.numThreads[2] != 1) return false;
+    static constexpr std::array<std::uint32_t, 9> loadedFillKernel{0xd7460000u, 0x04010c08u, 0xf4201a82u, 0xfa000000u, 0xbf8cc07fu, 0x7e02026au, 0xe0102000u, 0x80000100u, 0xbf810000u};
+    if (code.size() < loadedFillKernel.size() || !std::equal(loadedFillKernel.begin(), loadedFillKernel.end(), code.begin())) return false;
+    const auto stride = (userData[1] >> 16u) & 0x3fffu;
+    const bool swizzled = ((userData[1] >> 31u) & 1u) != 0;
+    const bool addTid = ((userData[3] >> 23u) & 1u) != 0;
+    const auto type = userData[3] >> 30u;
+    return type == 0 && stride == 4 && !swizzled && !addTid;
+}
+
 bool Driver::fillClearEnabled() {
     static const bool enabled = std::getenv("APS5_NO_FILL_CLEAR") == nullptr;
     return enabled;
@@ -89,7 +101,8 @@ void Driver::fillClearCount(const Graphics::StorageTexture::FillCoverage& covera
 }
 
 bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::shared_ptr<VulkanDevice>& localDevice) {
-    if (!matchesFillKernel(code, userData, compute)) return false;
+    const bool loaded = !matchesFillKernel(code, userData, compute);
+    if (loaded && !matchesLoadedFillKernel(code, userData, compute)) return false;
     const auto numRecords = userData[2];
     std::array<std::uint32_t, 3> groups{packet[1], packet[2], packet[3]};
     if ((packet[4] & 0x20u) != 0) {
@@ -101,8 +114,10 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     if (groups[1] != 1 || groups[2] != 1) return false;
     const auto records = std::min<std::uint64_t>(static_cast<std::uint64_t>(groups[0]) * 64u, numRecords);
     const auto base = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
-    const auto bytes = static_cast<std::size_t>(records * 16u);
-    const std::array<std::uint32_t, 4> pattern{userData[4], userData[5], userData[6], userData[7]};
+    const auto bytes = static_cast<std::size_t>(records * (loaded ? 4u : 16u));
+    if (loaded && (base % 16u != 0 || bytes % 16u != 0)) return false;
+    std::array<std::uint32_t, 4> pattern{};
+    if (!loaded) pattern = {userData[4], userData[5], userData[6], userData[7]};
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static std::atomic<std::uint64_t> fills{0}, filledBytes{0}, cpuFills{0};
 
@@ -130,6 +145,14 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         };
 
         recordLabelsForPacket(localDevice.get(), queueId);
+        if (loaded) {
+            const auto valueAddress = userData[4] | (static_cast<std::uint64_t>(userData[5] & 0xffffu) << 32u);
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(valueAddress), sizeof(std::uint32_t), sizeof(std::uint32_t));
+            Graphics::StorageTexture::FlushPending(valueAddress, sizeof(std::uint32_t), nullptr, "loaded fill value", Graphics::PublishScope::PartialUnits);
+            std::uint32_t value = 0;
+            std::memcpy(&value, reinterpret_cast<const void*>(valueAddress), sizeof(value));
+            pattern.fill(value);
+        }
         phase(FillLabels);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(base), bytes, 16, true);
         phase(FillCheck);

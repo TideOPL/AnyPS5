@@ -40,7 +40,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
     std::array<std::uint32_t, 5> resolved{};
-    if (indirectArguments != 0 && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
+    if (indirectArguments != 0 && (matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || matchesLoadedFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) {
 
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
