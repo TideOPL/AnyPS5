@@ -30,6 +30,7 @@ int APS5_VABI sceAjmBatchWait(std::uint32_t, std::uint32_t, std::uint32_t, AjmBa
 int APS5_VABI sceAjmBatchCancel(std::uint32_t, std::uint32_t);
 int APS5_VABI sceAjmBatchJobClearContext(AjmBatchInfo*, std::uint32_t, void*);
 int APS5_VABI sceAjmBatchJobSetResampleParameters(AjmBatchInfo*, std::uint32_t, float, std::uint32_t, void*);
+int APS5_VABI sceAjmBatchJobSetResampleParametersEx(AjmBatchInfo*, std::uint32_t, float, float, std::uint32_t, void*);
 int APS5_VABI sceAjmBatchJobGetResampleInfo(AjmBatchInfo*, std::uint32_t, void*);
 }
 
@@ -708,7 +709,7 @@ struct ResampledStream {
     ResampleInfo atEnd{};
 };
 
-ResampledStream Stream(std::uint32_t context, std::uint32_t instance, const std::uint8_t* stream, std::size_t size, std::size_t channels, std::size_t frames, float ratio) {
+ResampledStream Stream(std::uint32_t context, std::uint32_t instance, const std::uint8_t* stream, std::size_t size, std::size_t channels, std::size_t frames, float ratio, bool ramp = false, float change = 0.0f) {
     ResampledStream out;
     std::vector<std::int16_t> pcm(frames * channels);
     std::size_t offset = 0;
@@ -718,10 +719,12 @@ ResampledStream Stream(std::uint32_t context, std::uint32_t instance, const std:
         std::int64_t setResult[2] = {-1, -1};
         DecodeSideband sideband{};
         Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
-        if (ratio > 0) Require(sceAjmBatchJobSetResampleParameters(&info, instance, ratio, 1, setResult) == 0);
+        const bool setNow = ratio > 0 && (!ramp || out.jobs == 0);
+        if (setNow && ramp) Require(sceAjmBatchJobSetResampleParametersEx(&info, instance, ratio, change, 1, setResult) == 0);
+        else if (setNow) Require(sceAjmBatchJobSetResampleParameters(&info, instance, ratio, 1, setResult) == 0);
         Require(sceAjmBatchJobDecode(&info, instance, stream + offset, size - offset, pcm.data(), pcm.size() * sizeof(std::int16_t), &sideband) == 0);
         Submit(context, info);
-        if (ratio > 0) Require(setResult[0] == 0);
+        if (setNow) Require(setResult[0] == 0);
         Require(sideband.result == 0 || (offset == size && sideband.outputWritten == 0));
         offset += static_cast<std::size_t>(sideband.inputConsumed);
         if (offset < size && static_cast<std::size_t>(sideband.outputWritten) < pcm.size() * sizeof(std::int16_t)) ++out.shortJobs;
@@ -786,11 +789,24 @@ void TestResampleOpus(std::uint32_t context) {
     const double expected = static_cast<double>(reference.pcm.size() / 2 - 2) / 0.890899;
     Require(std::fabs(static_cast<double>(pitched.pcm.size() / 2) - expected) <= 2.0);
 
+    const std::uint32_t steadyEx = CreateOpus(context);
+    const auto steady = Stream(context, steadyEx, OPUS_STEREO, sizeof(OPUS_STEREO), 2, 512, 2.0f, true, 0.0f);
+    Require(steady.pcm == decimated.pcm);
+    const std::uint32_t ramped = CreateOpus(context);
+    constexpr double change = 1.0e-4;
+    const auto ramp = Stream(context, ramped, OPUS_STEREO, sizeof(OPUS_STEREO), 2, 512, 1.0f, true, static_cast<float>(change));
+    const double available = static_cast<double>(reference.pcm.size() / 2 - 2);
+    const double rampedFrames = (std::sqrt((1.0 - change / 2.0) * (1.0 - change / 2.0) + 2.0 * change * available) - (1.0 - change / 2.0)) / change;
+    Require(std::fabs(static_cast<double>(ramp.pcm.size() / 2) - rampedFrames) <= 3.0);
+    Require(ramp.afterFirstJob.ratio > 1.0f && std::fabs(ramp.afterFirstJob.ratio - static_cast<float>(1.0 + 512 * change)) <= 1.0e-4f);
+
     std::vector<std::uint8_t> batch(4096);
     AjmBatchInfo info{};
     std::int64_t result[2] = {-1, -1};
     Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
     for (const float bad : {0.0f, -1.0f, std::nanf(""), INFINITY}) Require(sceAjmBatchJobSetResampleParameters(&info, slower, bad, 1, result) == static_cast<int>(0x80930005));
+    for (const float bad : {0.0f, -1.0f, std::nanf(""), INFINITY}) Require(sceAjmBatchJobSetResampleParametersEx(&info, slower, bad, 0.0f, 1, result) == static_cast<int>(0x80930005));
+    Require(sceAjmBatchJobSetResampleParametersEx(&info, slower, 1.0f, std::nanf(""), 1, result) == static_cast<int>(0x80930005));
     Require(info.offset == 0);
 
     const std::size_t firstPacket = 2 + (OPUS_STEREO[0] | (std::size_t{OPUS_STEREO[1]} << 8u));
