@@ -321,6 +321,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             } else {
                 direct.firstVertex = indirect.indxOffset;
             }
+            if (graphics.rectList) {
+                direct.indexCount -= direct.indexCount % 3u;
+                if (direct.indexCount == 0) continue;
+            }
             if (graphics.stages.mesh) {
                 setMeshIndexBuffer(direct);
                 patched.insert(0);
