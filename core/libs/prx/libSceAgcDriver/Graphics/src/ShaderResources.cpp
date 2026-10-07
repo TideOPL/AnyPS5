@@ -440,7 +440,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
-    constexpr std::uint64_t budget = 2048ull << 20u;
+    static const std::uint64_t budget = (std::getenv("DBG_TEXTURE_CACHE_MIB") ? std::strtoull(std::getenv("DBG_TEXTURE_CACHE_MIB"), nullptr, 10) : 2048ull) << 20u;
     while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) eraseTexture(cache, std::prev(cache.entries.end()));
     cache.bytes += entry.accounted;
     auto texture = entry.texture;
@@ -615,7 +615,7 @@ std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std
     // APS5_NO_KEEP_NEW_STORAGE=1 leaves the image to its cache entry alone, as before.
     static const bool keepNew = std::getenv("APS5_NO_KEEP_NEW_STORAGE") == nullptr;
     if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
-    constexpr std::uint64_t budget = 2048ull << 20u;
+    static const std::uint64_t budget = (std::getenv("DBG_STORAGE_CACHE_MIB") ? std::strtoull(std::getenv("DBG_STORAGE_CACHE_MIB"), nullptr, 10) : 2048ull) << 20u;
     while (!cache.entries.empty() && cache.bytes + entry.texture->GuestBytes() > budget) evictStorage(cache, std::prev(cache.entries.end()));
     cache.bytes += entry.texture->GuestBytes();
     auto texture = entry.texture;
