@@ -5,6 +5,39 @@
 #include <chrono>
 #include <cstdint>
 #include <stdexcept>
+#include <thread>
+#ifdef _WIN32
+#include <windows.h>
+
+namespace {
+
+PSRWLOCK Srw(void** storage) {
+    static_assert(sizeof(SRWLOCK) == sizeof(void*));
+    return reinterpret_cast<PSRWLOCK>(storage);
+}
+
+template <typename TryAcquire>
+bool PollUntil(std::chrono::microseconds duration, TryAcquire tryAcquire) {
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    for (unsigned attempt = 0;; ++attempt) {
+        if (tryAcquire()) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        if (attempt < 64) std::this_thread::yield();
+        else std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+}
+
+}
+
+void GuestRwlock::lock_shared() { AcquireSRWLockShared(Srw(&_srw)); }
+bool GuestRwlock::try_lock_shared() { return TryAcquireSRWLockShared(Srw(&_srw)) != 0; }
+bool GuestRwlock::try_lock_shared_for(std::chrono::microseconds duration) { return PollUntil(duration, [&] { return try_lock_shared(); }); }
+void GuestRwlock::unlock_shared() { ReleaseSRWLockShared(Srw(&_srw)); }
+void GuestRwlock::lock() { AcquireSRWLockExclusive(Srw(&_srw)); }
+bool GuestRwlock::try_lock() { return TryAcquireSRWLockExclusive(Srw(&_srw)) != 0; }
+bool GuestRwlock::try_lock_for(std::chrono::microseconds duration) { return PollUntil(duration, [&] { return try_lock(); }); }
+void GuestRwlock::unlock() { ReleaseSRWLockExclusive(Srw(&_srw)); }
+#endif
 
 static constexpr int SCE_OK = 0;
 static constexpr int SCE_KERNEL_ERROR_ENOMEM = 0x8002000C;

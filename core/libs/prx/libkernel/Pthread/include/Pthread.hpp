@@ -5,6 +5,7 @@
 #include "SceTypes.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -38,8 +39,27 @@ struct PthreadRwlockattrPrivate {
     int type;
 };
 
+#ifdef _WIN32
+class GuestRwlock {
+public:
+    void lock_shared();
+    bool try_lock_shared();
+    bool try_lock_shared_for(std::chrono::microseconds duration);
+    void unlock_shared();
+    void lock();
+    bool try_lock();
+    bool try_lock_for(std::chrono::microseconds duration);
+    void unlock();
+
+private:
+    void* _srw = nullptr;
+};
+#else
+using GuestRwlock = std::shared_timed_mutex;
+#endif
+
 struct PthreadRwlockPrivate {
-    std::shared_timed_mutex _lock;
+    GuestRwlock _lock;
     std::atomic<std::thread::id> _writer;
 };
 
