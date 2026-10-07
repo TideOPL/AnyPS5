@@ -11,7 +11,6 @@ static void Require(bool condition, const char* message) {
     }
 }
 
-// The first call in a process also fixes the process start, so it must not read the clock before it.
 int main(int argc, char** argv) {
     constexpr std::uint64_t minuteMicros = 60ULL * 1000 * 1000;
     if (argc > 1 && std::strcmp(argv[1], "counter") == 0) {

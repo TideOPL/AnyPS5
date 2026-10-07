@@ -51,7 +51,6 @@ struct PadOutputState {
 namespace Pad {
 void Initialize();
 PadData ReadState();
-// Drains up to `num` queued states, oldest first; with none queued, writes the current state. Returns the count written.
 int Read(PadData* data, int num);
 void SetVibration(std::uint8_t large, std::uint8_t small);
 void SetVibrationMode(int mode);

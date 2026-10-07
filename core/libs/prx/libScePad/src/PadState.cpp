@@ -18,7 +18,6 @@ namespace {
         PadInputState input;
         std::uint64_t timestamp = 0;
     };
-    // States published since the last scePadRead; the oldest is dropped once 64 are waiting.
     constexpr std::size_t kQueueCapacity = 64;
     std::deque<QueuedInput> queue;
     std::exception_ptr failure;
@@ -108,7 +107,6 @@ void Pad::Initialize() {
 }
 
 namespace {
-// Converts one input sample; motion fusion integrates up to `now` and touch ids advance per call.
 PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uint64_t now) {
     PadData data{};
     data.buttons = state.buttons;
