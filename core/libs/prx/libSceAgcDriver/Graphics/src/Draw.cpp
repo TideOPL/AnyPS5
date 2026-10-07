@@ -771,6 +771,31 @@ struct DrawInputs {
     std::uint32_t meshGroups = 0;
 };
 
+std::shared_ptr<Buffer> outOfRangeVertexBuffer(const Context& context, const ShaderRecompiler::VertexAttribute& attribute) {
+    constexpr std::size_t zeroBytes = 256;
+    const auto bytes = static_cast<std::size_t>(DecodeVertexFormat(attribute).bytes);
+    const auto inRange = VertexFetchInRangeBytes(attribute);
+    Require(bytes <= zeroBytes, "out-of-range vertex fetch exceeds the zero buffer");
+    if (inRange == 0) {
+        static std::mutex zeroMutex;
+        static std::map<VkDevice, std::shared_ptr<Buffer>> zeroBuffers;
+        std::lock_guard lock(zeroMutex);
+        auto& zero = zeroBuffers[context.device];
+        if (zero == nullptr) {
+            zero = std::make_shared<Buffer>(context, zeroBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            std::fill(zero->Bytes().begin(), zero->Bytes().end(), std::byte{0});
+        }
+        return zero;
+    }
+    const auto& fields = attribute.resource.fields;
+    const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
+    auto buffer = std::make_shared<Buffer>(context, zeroBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    const auto target = buffer->Bytes();
+    std::fill(target.begin(), target.end(), std::byte{0});
+    GuestMemory::Read(address, target.first(inRange));
+    return buffer;
+}
+
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
@@ -876,12 +901,20 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     }
     std::vector<VertexFetch> fetches;
     fetches.reserve(attributes.size());
-    for (const auto& attribute : attributes) {
+    std::vector<std::size_t> fetchOf(attributes.size(), 0);
+    std::vector<std::shared_ptr<Buffer>> outOfRange(attributes.size());
+    for (std::size_t i = 0; i < attributes.size(); ++i) {
+        const auto& attribute = attributes[i];
+        if (args == nullptr && VertexFetchPastRawRange(attribute)) {
+            outOfRange[i] = outOfRangeVertexBuffer(context, attribute);
+            continue;
+        }
         // An indirect draw's counts are unknown here: the descriptor's whole range is copied.
         const auto bytes = args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance);
         const auto& fields = attribute.resource.fields;
         const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
         Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address, "vertex buffer aliases the render target");
+        fetchOf[i] = fetches.size();
         fetches.push_back({address, address + bytes, (fields[1] >> 16u) & 0x3fffu, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
     }
     const auto plan = PlanVertexCopies(fetches);
@@ -893,8 +926,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
     for (std::size_t i = 0; i < attributes.size(); ++i) {
-        inputs.vertexHandles.push_back(inputs.vertexBuffers[plan.copyOf[i]]->Handle());
-        inputs.vertexOffsets[i] = plan.offsets[i];
+        if (outOfRange[i] != nullptr) {
+            inputs.vertexHandles.push_back(outOfRange[i]->Handle());
+            inputs.vertexOffsets[i] = 0;
+            inputs.vertexBuffers.push_back(std::move(outOfRange[i]));
+            continue;
+        }
+        inputs.vertexHandles.push_back(inputs.vertexBuffers[plan.copyOf[fetchOf[i]]]->Handle());
+        inputs.vertexOffsets[i] = plan.offsets[fetchOf[i]];
     }
     timer.phase(PhaseVertex);
     return inputs;

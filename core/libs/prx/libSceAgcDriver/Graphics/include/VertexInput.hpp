@@ -132,6 +132,16 @@ inline std::size_t VertexBufferExtent(const ShaderRecompiler::VertexAttribute& a
     return static_cast<std::size_t>(bytes);
 }
 
+inline bool VertexFetchPastRawRange(const ShaderRecompiler::VertexAttribute& attribute) {
+    const auto stride = (attribute.resource.fields[1] >> 16u) & 0x3fffu;
+    return stride == 0 && DecodeVertexFormat(attribute).bytes > attribute.resource.fields[2];
+}
+
+inline std::size_t VertexFetchInRangeBytes(const ShaderRecompiler::VertexAttribute& attribute) {
+    const std::size_t records = attribute.resource.fields[2] & ~3u;
+    return std::min<std::size_t>(records, DecodeVertexFormat(attribute).bytes);
+}
+
 inline std::size_t VertexBufferReadSize(const ShaderRecompiler::VertexAttribute& attribute, std::uint32_t maxIndex, std::uint32_t instances, std::uint32_t firstInstance = 0) {
     Require(instances != 0, "vertex input requires nonzero instance count");
     Require(firstInstance <= std::numeric_limits<std::uint32_t>::max() - (instances - 1u), "vertex input instance range overflow");
