@@ -244,6 +244,11 @@ bool lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancil
     IrValue* rebuilt = nullptr;
     for (const IrUse& use : rest) {
         IrValue& user = *use.user;
+        const bool extract = user.Opcode() == IrOpcode::BitFieldUExtract || user.Opcode() == IrOpcode::BitFieldSExtract;
+        const bool carried = user.Opcode() == IrOpcode::SelectU32 || user.Opcode() == IrOpcode::Phi;
+        // An extract with constant bounds outside the two fields stays refused, as does any other use.
+        if (extract && (use.operand != 0u || (isImmediate(resolveArg(user, 1), IrType::U32) && isImmediate(resolveArg(user, 2), IrType::U32)))) continue;
+        if (!extract && !carried) continue;
         if (rebuilt == nullptr) {
             rebuilt = &program.CreateValue(IrOpcode::ShiftLeftLogical32, IrType::U32);
             rebuilt->AddArgument(&field(1u));

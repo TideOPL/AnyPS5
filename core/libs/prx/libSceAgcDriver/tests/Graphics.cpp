@@ -696,9 +696,15 @@ void DepthStencilTests() {
     Require(volume.color.address == sliced && volume.color.depth == 4u && volume.color.depthSlice == 2u, "a color view of one 3D depth slice did not keep the surface address and select the slice");
     queue.context[0x31b] = 4u | (4u << 13u);
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "beyond the 3D surface");
+    // A layered view of every slice: SLICE_MAX holds the slice count (an exclusive end).
+    queue.context[0x31b] = 4u << 13u;
+    const auto layered = AgcDriver::Graphics::DecodeState(queue);
+    Require(layered.color.address == sliced && layered.color.depthSlice == 0u && layered.color.layerCount == 4u, "a layered view of a 3D target did not cover all of its slices");
     queue.context[0x31b] = 0;
     queue.context[0x31c] |= 0x10000000;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "DCC 3D color targets");
+    queue.context[0x325] = static_cast<std::uint32_t>(sliced >> 8u);
+    const auto compressed = AgcDriver::Graphics::DecodeState(queue);
+    Require(compressed.color.layerCount == 1u, "a DCC 3D color target did not decode");
 }
 
 // SPI_SHADER_Z_FORMAT (0x1c4) and the export enables of DB_SHADER_CONTROL (0x203): Z export needs a

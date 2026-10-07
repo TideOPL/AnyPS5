@@ -261,7 +261,7 @@ std::uint32_t ExportVector(SpirvValueEmitContext& ctx, std::uint32_t data, const
                     continue;
                 }
                 raw.at(component) = state.module.AllocateId();
-                state.module.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), raw.at(component), packed, ConstantU32(state, lane * 16u), ConstantU32(state, 16u));
+                state.module.AddFunction(mode == 8u ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract, TypeU32(state), raw.at(component), packed, ConstantU32(state, lane * 16u), ConstantU32(state, 16u));
             }
         }
     } else {
