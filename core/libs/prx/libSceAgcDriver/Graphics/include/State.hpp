@@ -52,6 +52,9 @@ struct ColorTarget {
     std::uint32_t slot = 0;
     std::uint32_t depth = 1;
     std::uint32_t depthSlice = 0;
+    // Slices depthSlice .. depthSlice + layerCount - 1 of a 3D target bound at once; the vertex
+    // stage picks one per primitive (its render target index export, gl_Layer here).
+    std::uint32_t layerCount = 1;
     std::uint32_t exportIndex = 0;
 };
 

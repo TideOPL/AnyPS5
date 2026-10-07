@@ -1970,7 +1970,15 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                 previous.end = std::max(previous.end, region.end);
                 continue;
             }
-            Require(previous.writable == region.writable, "writable guest memory overlaps an immutable snapshot");
+            if (previous.writable != region.writable) {
+                // A read-only view of memory the draw also writes (a layered draw reading back the
+                // buffer it fills): the writable copy is filled from the same guest bytes the
+                // snapshot was taken from, so the merged range is served by it alone.
+                previous.writable = true;
+                previous.snapshot.clear();
+                previous.end = std::max(previous.end, region.end);
+                continue;
+            }
             if (!region.writable) {
                 const auto offset = static_cast<std::size_t>(region.begin - previous.begin);
                 const auto overlap = static_cast<std::size_t>(std::min(previous.end, region.end) - region.begin);

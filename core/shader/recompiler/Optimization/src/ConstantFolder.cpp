@@ -236,6 +236,23 @@ bool lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancil
         user.ReplaceArgument(1, &builder.Constant(offset.ImmediateU32() - range->first));
         lowered = true;
     }
+    // Any other use (an extract whose bounds are not folded yet, or the old value a predicated write
+    // keeps for inactive lanes) reads the word rebuilt from the render target index alone: the
+    // sample index is left out, since reading it would force sample-rate shading.
+    std::vector<IrUse> rest;
+    collectUses(ancillary, rest);
+    IrValue* rebuilt = nullptr;
+    for (const IrUse& use : rest) {
+        IrValue& user = *use.user;
+        if (rebuilt == nullptr) {
+            rebuilt = &program.CreateValue(IrOpcode::ShiftLeftLogical32, IrType::U32);
+            rebuilt->AddArgument(&field(1u));
+            rebuilt->AddArgument(&builder.Constant(16u));
+            ancillary.Parent()->InsertInstructionBefore(&ancillary, rebuilt);
+        }
+        user.ReplaceArgument(use.operand, rebuilt);
+        lowered = true;
+    }
     return lowered;
 }
 

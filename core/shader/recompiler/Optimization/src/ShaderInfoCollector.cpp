@@ -115,8 +115,19 @@ void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inpu
                     const auto kind = static_cast<StageInputKind>(kindValue->ImmediateU32());
                     const auto component = componentValue->ImmediateU32();
                     switch (kind) {
-                        case StageInputKind::PackedAncillary:
-                            return Fail("packed pixel ancillary input has an unsupported live use");
+                        case StageInputKind::PackedAncillary: {
+                            std::string users;
+                            for (const IrUse& use : inst->OperandUses()) {
+                                users += std::string(" ") + std::string(IrOpcodeName(use.user->Opcode())) + "#" + std::to_string(use.operand);
+                                if (use.user->Opcode() == IrOpcode::BitFieldUExtract || use.user->Opcode() == IrOpcode::BitFieldSExtract) {
+                                    for (std::size_t a = 1; a < 3; ++a) {
+                                        const IrValue* arg = use.user->Argument(a)->Resolve();
+                                        users += arg->HasImmediate() ? "(" + std::to_string(arg->ImmediateU32()) + ")" : "(" + std::string(IrOpcodeName(arg->Opcode())) + ")";
+                                    }
+                                }
+                            }
+                            return Fail("packed pixel ancillary input has an unsupported live use:" + users);
+                        }
                         case StageInputKind::Layer:
                         case StageInputKind::SampleId:
                             if (program.Resources().stage != IrShaderStage::Pixel || component != 0u) {

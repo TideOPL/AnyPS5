@@ -659,7 +659,8 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto view = read(cx, 0x31b + stride);
     Require((view & ~0x3fffffffu) == 0, "reserved CB_COLOR_VIEW bits are set");
     const auto slice = view & 0x1fffu;
-    Require(slice == ((view >> 13u) & 0x1fffu), "color views of several array slices are unsupported");
+    auto sliceMax = (view >> 13u) & 0x1fffu;
+    Require(sliceMax >= slice, "the color view's last slice precedes its first");
     const auto viewMip = (view >> 26u) & 0xfu;
     zero(cx, 0x31d + stride, ~0u, "color samples, fragments or destination alpha override");
     const auto attrib2 = read(cx, 0x3b0 + slot);
@@ -670,10 +671,18 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const bool volume = ((attrib3 >> 24u) & 3u) == 2u;
     if (volume) {
         color.depth = (attrib3 & 0x1fffu) + 1u;
-        Require(maxMip == 0 && (info & 0x10000000u) == 0, "mipmapped or DCC 3D color targets are unsupported");
-        Require(slice < color.depth, "the color view slice is beyond the 3D surface");
+        Require(maxMip == 0, "mipmapped 3D color targets are unsupported");
+        // Layered 3D views set SLICE_MAX to the slice count (0-32 over 32 slices): the end is exclusive.
+        if (sliceMax == color.depth && sliceMax > slice) sliceMax = color.depth - 1u;
+        if (sliceMax >= color.depth) {
+            char text[160];
+            std::snprintf(text, sizeof(text), "the color view slices %u-%u are beyond the 3D surface of %u slices (CB_COLOR_VIEW 0x%08x, ATTRIB3 0x%08x)", slice, sliceMax, color.depth, view, attrib3);
+            Require(false, text);
+        }
         color.depthSlice = slice;
+        color.layerCount = sliceMax - slice + 1u;
     }
+    Require(volume || sliceMax == slice, "color views of several array slices of a 2D array are unsupported");
     color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};
     color.elementBytes = decoded.elementBytes;
     std::uint64_t mipOffset = 0;
