@@ -352,7 +352,13 @@ void testCopies() {
     check(source == destination, "DMA_DATA GDS round trip failed");
     expectFailure([&] { execute(state, makePacket(0x50, {0x60100000, low(source.data()), high(source.data()), 0xfffc, 0, 8})); }, "exceeds the GDS");
     expectFailure([&] { execute(state, makePacket(0x50, {0x20000000, 0, 1, low(destination.data()), high(destination.data()), 4})); }, "exceeds the GDS");
-    expectFailure([&] { execute(state, makePacket(0x50, {0x60200000, low(source.data()), high(source.data()), 0, 0, 4})); }, "destination is not implemented");
+    const auto beforeNowhere = destination;
+    const auto nowhere = makePacket(0x50, {0x66204000, 0, 0, 0, 0, 0x40000000});
+    check(!AgcDriver::Pm4::ResolveStore(nowhere, state, 64).has_value(), "DMA_DATA to nowhere resolved as a store");
+    execute(state, nowhere);
+    execute(state, makePacket(0x50, {0x60200000, low(source.data()), high(source.data()), 0, 0, 4}));
+    check(destination == beforeNowhere, "DMA_DATA to nowhere wrote memory");
+    expectFailure([&] { execute(state, makePacket(0x50, {0x60000000, low(source.data()), high(source.data()), 0x100, 0, 0x08000004})); }, "destination is not implemented");
     expectFailure([&] { execute(state, makePacket(0x50, {0x60000000 | (1u << 15u), low(source.data()), high(source.data()), low(destination.data()), high(destination.data()), 4})); }, "reserved fields");
     expectFailure([&] { execute(state, makePacket(0x37, {0x100, 0x1000, 0, 1})); }, "guest");
 #ifdef _WIN32
