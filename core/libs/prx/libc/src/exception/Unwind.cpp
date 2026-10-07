@@ -79,7 +79,7 @@ struct Frame {
     bool signal {};
 };
 
-bool DecodeCandidate(_Unwind_Context& context, Frame& frame, const Lookup& query) {
+bool DecodeCandidate(_Unwind_Context& context, Frame& frame, const Lookup& query, bool rangeOnly = false) {
     if (!query.fde) return false;
     const Byte* p = query.fde;
     auto length = Read<std::uint32_t>(p);
@@ -123,6 +123,7 @@ bool DecodeCandidate(_Unwind_Context& context, Frame& frame, const Lookup& query
     frame.cieBegin = c;
     frame.start = Encoded(p, pointerEncoding, query.data, 0, query.text);
     frame.length = Encoded(p, pointerEncoding & 15);
+    if (rangeOnly) return true;
     if (query.pc < frame.start || query.pc - frame.start >= frame.length) return false;
     if (*augmentation == 'z') {
         Word size = Uleb(p);
@@ -139,6 +140,105 @@ bool DecodeCandidate(_Unwind_Context& context, Frame& frame, const Lookup& query
     return true;
 }
 
+#ifdef _WIN32
+// A module without .ehmeta (the host-built prx and DLLs) has only .eh_frame, which carries no search
+// table: scanning it decodes every FDE before the one sought, ~120 us per frame for the AGC driver,
+// so a throw out of a draw cost 1.3 ms. Each such module's FDEs are indexed once, sorted by start.
+struct FdeEntry { Word start; Word end; const Byte* record; };
+struct FdeIndex { const Byte* base; DWORD stamp; DWORD size; FdeEntry* entries; std::size_t count; };
+constexpr std::size_t FdeIndexCapacity = 1024;
+SRWLOCK fdeIndexLock = SRWLOCK_INIT;
+FdeIndex fdeIndexes[FdeIndexCapacity];
+std::size_t fdeIndexCount = 0;
+
+const FdeIndex* FindFdeIndex(const Byte* base, const IMAGE_NT_HEADERS64* nt) {
+    for (std::size_t i = 0; i < fdeIndexCount; ++i) {
+        const auto& index = fdeIndexes[i];
+        if (index.base == base && index.stamp == nt->FileHeader.TimeDateStamp && index.size == nt->OptionalHeader.SizeOfImage) return &index;
+    }
+    return nullptr;
+}
+
+const FdeIndex* BuildFdeIndex(const Byte* base, const IMAGE_NT_HEADERS64* nt) {
+    AcquireSRWLockShared(&fdeIndexLock);
+    const auto* found = FindFdeIndex(base, nt);
+    ReleaseSRWLockShared(&fdeIndexLock);
+    if (found) return found;
+    AcquireSRWLockExclusive(&fdeIndexLock);
+    found = FindFdeIndex(base, nt);
+    if (found || fdeIndexCount == FdeIndexCapacity) {
+        ReleaseSRWLockExclusive(&fdeIndexLock);
+        return found;
+    }
+    const auto* sections = IMAGE_FIRST_SECTION(nt);
+    std::size_t capacity = 0, count = 0;
+    FdeEntry* entries = nullptr;
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        const auto& section = sections[i];
+        if (std::memcmp(section.Name, ".ehfram", 8) != 0) continue;
+        const Byte* p = base + section.VirtualAddress;
+        const Byte* end = p + section.Misc.VirtualSize;
+        while (end - p >= 8) {
+            const Byte* record = p;
+            const auto length = Read<std::uint32_t>(p);
+            if (!length) continue;
+            if (length == 0xffffffff || length < 4 || Word(end - p) < length) break;
+            const Byte* next = p + length;
+            if (Read<std::uint32_t>(p)) {
+                Lookup query {0, record};
+                Frame frame {};
+                _Unwind_Context scratch {};
+                if (DecodeCandidate(scratch, frame, query, true) && frame.length != 0) {
+                    if (count == capacity) {
+                        capacity = capacity ? capacity * 2 : 1024;
+                        auto* grown = static_cast<FdeEntry*>(HeapAlloc(GetProcessHeap(), 0, capacity * sizeof(FdeEntry)));
+                        if (!grown) break;
+                        if (entries) {
+                            std::memcpy(grown, entries, count * sizeof(FdeEntry));
+                            HeapFree(GetProcessHeap(), 0, entries);
+                        }
+                        entries = grown;
+                    }
+                    entries[count++] = {frame.start, frame.start + frame.length, record};
+                }
+            }
+            p = next;
+        }
+    }
+    // Insertion sort would be quadratic on the driver's tens of thousands of FDEs; the order is
+    // already ascending in practice, so check first and fall back to a heap sort.
+    bool sorted = true;
+    for (std::size_t i = 1; i < count && sorted; ++i) sorted = entries[i - 1].start <= entries[i].start;
+    if (!sorted) {
+        const auto less = [](const FdeEntry& a, const FdeEntry& b) { return a.start < b.start; };
+        const auto sift = [&](std::size_t root, std::size_t size) {
+            for (;;) {
+                std::size_t child = root * 2 + 1;
+                if (child >= size) return;
+                if (child + 1 < size && less(entries[child], entries[child + 1])) ++child;
+                if (!less(entries[root], entries[child])) return;
+                const auto swap = entries[root];
+                entries[root] = entries[child];
+                entries[child] = swap;
+                root = child;
+            }
+        };
+        for (std::size_t i = count / 2; i-- > 0;) sift(i, count);
+        for (std::size_t i = count; i-- > 1;) {
+            const auto swap = entries[0];
+            entries[0] = entries[i];
+            entries[i] = swap;
+            sift(0, i);
+        }
+    }
+    auto& index = fdeIndexes[fdeIndexCount];
+    index = {base, nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage, entries, count};
+    ++fdeIndexCount;
+    ReleaseSRWLockExclusive(&fdeIndexLock);
+    return &index;
+}
+#endif
+
 bool DecodeFrame(_Unwind_Context& context, Frame& frame) {
     Lookup query {context.registers[16] - !context.signalFrame};
 #ifdef __linux__
@@ -154,8 +254,30 @@ bool DecodeFrame(_Unwind_Context& context, Frame& frame) {
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
     const auto* sections = IMAGE_FIRST_SECTION(nt);
+    static const bool scanFrames = std::getenv("APS5_NO_FDE_INDEX") != nullptr;
+    bool indexed = false;
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
         const auto& section = sections[i];
+        if (!scanFrames && std::memcmp(section.Name, ".ehfram", 8) == 0) {
+            if (indexed) continue;
+            indexed = true;
+            const auto* index = BuildFdeIndex(base, nt);
+            std::size_t lo = 0, hi = index ? index->count : 0;
+            while (lo < hi) {
+                const auto mid = lo + (hi - lo) / 2;
+                if (index->entries[mid].start <= query.pc) lo = mid + 1;
+                else hi = mid;
+            }
+            // FDEs may nest or overlap in principle: try the nearest starts below the pc.
+            for (std::size_t candidate = lo; candidate-- > 0 && lo - candidate <= 8;) {
+                const auto& entry = index->entries[candidate];
+                if (query.pc >= entry.end) continue;
+                query.fde = entry.record;
+                frame = {};
+                if (DecodeCandidate(context, frame, query)) return true;
+            }
+            if (index) continue;
+        }
         if (std::memcmp(section.Name, ".ehmeta", 8) == 0) {
             const Byte* metadata = base + section.VirtualAddress;
             const Byte* header = base + Read<std::uint32_t>(metadata);
