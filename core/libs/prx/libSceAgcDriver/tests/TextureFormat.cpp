@@ -12,6 +12,38 @@ namespace {
 
 using namespace AgcDriver::Graphics;
 
+VkFormat unsampledFormats[2]{};
+
+void unsampledFormatProperties(VkPhysicalDevice, VkFormat format, VkFormatProperties* properties) {
+    *properties = {};
+    if (format != unsampledFormats[0] && format != unsampledFormats[1]) properties->optimalTilingFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+}
+
+std::uint32_t decodedWithout(VkFormat first = VK_FORMAT_UNDEFINED, VkFormat second = VK_FORMAT_UNDEFINED) {
+    unsampledFormats[0] = first;
+    unsampledFormats[1] = second;
+    return SrgbDecodeFormats(unsampledFormatProperties, VK_NULL_HANDLE);
+}
+
+void srgbDecodeTests() {
+    constexpr std::uint32_t srgb8 = 1u;
+    constexpr std::uint32_t srgb8_8 = 2u;
+    Require(decodedWithout() == 0u, "a device that samples every sRGB format needs no shader decode");
+    Require(decodedWithout(VK_FORMAT_R8G8_SRGB) == srgb8_8, "a device without sampled R8G8_SRGB must decode 8_8_SRGB in the shader");
+    Require(decodedWithout(VK_FORMAT_R8_SRGB) == srgb8, "a device without sampled R8_SRGB must decode 8_SRGB in the shader");
+    Require(decodedWithout(VK_FORMAT_R8_SRGB, VK_FORMAT_R8G8_SRGB) == (srgb8 | srgb8_8), "a device without either 8-bit sRGB format must decode both in the shader");
+    Require(decodedWithout(VK_FORMAT_R8G8_SRGB, VK_FORMAT_R8G8_UNORM) == 0u, "8_8_SRGB without a sampled UNORM view must not be decoded in the shader");
+    Require(decodedWithout(VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_BC1_RGBA_SRGB_BLOCK) == 0u, "only the 8 and 8_8 sRGB formats may be decoded in the shader");
+    Context context{};
+    Require(SampledTextureFormat(context, 129) == VK_FORMAT_R8G8_SRGB && SampledTextureFormat(context, 128) == VK_FORMAT_R8_SRGB, "sRGB textures must keep their sRGB views without shader decode");
+    context.srgbDecodeFormats = srgb8_8;
+    Require(SampledTextureFormat(context, 129) == VK_FORMAT_R8G8_UNORM, "8_8_SRGB decoded in the shader must be viewed as R8G8_UNORM");
+    Require(SampledTextureFormat(context, 128) == VK_FORMAT_R8_SRGB, "8_SRGB must keep its sRGB view when only 8_8_SRGB is decoded in the shader");
+    context.srgbDecodeFormats = srgb8 | srgb8_8;
+    Require(SampledTextureFormat(context, 128) == VK_FORMAT_R8_UNORM, "8_SRGB decoded in the shader must be viewed as R8_UNORM");
+    Require(SampledTextureFormat(context, 130) == VK_FORMAT_R8G8B8A8_SRGB && SampledTextureFormat(context, 14) == VK_FORMAT_R8G8_UNORM && SampledTextureFormat(context, 170) == VK_FORMAT_BC1_RGBA_SRGB_BLOCK, "formats without a shader decode must keep their views");
+}
+
 template<typename TAction>
 void reject(TAction action, std::string_view reason) {
     try {
@@ -43,6 +75,7 @@ void convertedDccClearTests() {
 }
 
 void RunTextureFormatTests() {
+    srgbDecodeTests();
     Require(ResolveTextureFormat(1) == VK_FORMAT_R8_UNORM, "format 1 must resolve to R8_UNORM");
     Require(BytesPerElement(1) == 1u, "format 1 must be one byte wide");
     Require(!IsBlockCompressed(1), "format 1 must not be block compressed");
@@ -50,6 +83,9 @@ void RunTextureFormatTests() {
 
     Require(ResolveTextureFormat(56) == VK_FORMAT_R8G8B8A8_UNORM, "format 56 must resolve to R8G8B8A8_UNORM");
     Require(BytesPerElement(56) == 4u, "format 56 must be four bytes wide");
+
+    Require(ResolveTextureFormat(6) == VK_FORMAT_R8_SINT, "format 6 must resolve to R8_SINT");
+    Require(BytesPerElement(6) == 1u, "format 6 must be one byte wide");
 
     Require(ResolveTextureFormat(22) == VK_FORMAT_R32_SFLOAT, "format 22 must resolve to R32_SFLOAT");
     Require(BytesPerElement(22) == 4u, "format 22 must be four bytes wide");

@@ -430,6 +430,8 @@ bool TranslationContext::emitMemory(const RdnaInstruction& inst) {
         return dsAtomic64(inst, IrOpcode::SharedAtomicFMax64, true);
     case RdnaOpcode::DsWrxchgRtnB64:
         return dsAtomic64(inst, IrOpcode::SharedAtomicSwap64, true);
+    case RdnaOpcode::DsCondxchg32RtnB64:
+        return dsCondxchg32(inst);
     case RdnaOpcode::DsNop:
         emitControlNop();
         return true;
@@ -475,6 +477,8 @@ bool TranslationContext::emitMemory(const RdnaInstruction& inst) {
         return dsWrite2(inst);
     case RdnaOpcode::DsWrxchg2RtnB32:
     case RdnaOpcode::DsWrxchg2st64RtnB32:
+    case RdnaOpcode::DsWrxchg2RtnB64:
+    case RdnaOpcode::DsWrxchg2st64RtnB64:
         return dsWrxchg2(inst);
     case RdnaOpcode::DsWriteB8:
     case RdnaOpcode::DsWriteB16:

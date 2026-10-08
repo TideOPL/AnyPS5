@@ -73,6 +73,7 @@ struct ImageResource {
     bool depthCompare = false;
     bool cube = false;
     bool r128 = false;
+    bool srgbDecode = false;
     bool depthBits = false;
     bool depthUnorm16 = false;
     bool packed = false;

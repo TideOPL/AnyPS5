@@ -18,6 +18,7 @@
 #include <vector>
 
 #if defined(__linux__)
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <fstream>
@@ -194,13 +195,13 @@ void ValidateRange(const void* addr, size_t len, size_t alignment) {
 }
 
 int LinuxProtFromSce(int prot) {
-    if ((prot & ~0xF7) != 0) {
+    if ((prot & ~0x3F7) != 0) {
         // return SCE_KERNEL_ERROR_EINVAL;
         throw std::invalid_argument("Unsupported memory protection bits: " + std::to_string(prot));
     }
     int result = PROT_NONE;
-    if (prot & 0x13) result |= PROT_READ;
-    if (prot & 0x22) result |= PROT_READ | PROT_WRITE;
+    if (prot & 0x113) result |= PROT_READ;
+    if (prot & 0x222) result |= PROT_READ | PROT_WRITE;
     if (prot & 4) result |= PROT_READ | PROT_EXEC;
     return result;
 }
@@ -233,17 +234,26 @@ public:
             throw std::system_error(error, std::system_category(), message);
         }
 #else
-        file = memfd_create("direct memory", MFD_CLOEXEC);
+        file = memfd_create("direct memory", MFD_CLOEXEC | MFD_ALLOW_SEALING);
         if (file < 0) throw std::system_error(errno, std::generic_category(), "create direct memory backing");
         if (ftruncate(file, static_cast<off_t>(bytes)) != 0) {
             const int error = errno;
             ::close(file);
             throw std::system_error(error, std::generic_category(), "size direct memory backing");
         }
+        if (fcntl(file, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW) != 0) {
+            const int error = errno;
+            ::close(file);
+            throw std::system_error(error, std::generic_category(), "seal direct memory backing");
+        }
 #endif
     }
 
     int MemoryType() const { return memoryType; }
+
+#if defined(__linux__)
+    int File() const { return file; }
+#endif
 
     ~PhysicalBacking() {
 #ifdef _WIN32
@@ -350,6 +360,32 @@ void WatchMapping(std::uintptr_t address, std::size_t len) {
             GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(base + (first - other.phys)), last - first);
         }
     }
+}
+#endif
+
+#if defined(__linux__)
+bool SharedBacking(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset) {
+    std::lock_guard lock(g_directLock);
+    const auto next = g_directMappings.upper_bound(address);
+    if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address || next == g_directMappings.begin()) return false;
+    auto it = std::prev(next);
+    if (address >= it->second.end) return false;
+    const auto backing = it->second.backing;
+    const auto phys = it->second.phys + (address - it->first);
+    const auto page = g_physPages.find(phys - phys % PS5_PAGE_SIZE);
+    if (page == g_physPages.end() || page->second.backing != backing) return false;
+    const auto end = address + bytes;
+    for (auto covered = it->second.end; covered < end;) {
+        const auto following = std::next(it);
+        if (following == g_directMappings.end() || following->first != covered || following->second.backing != backing || following->second.phys != it->second.phys + (it->second.end - it->first)) return false;
+        it = following;
+        covered = it->second.end;
+    }
+    const int duplicate = fcntl(backing->File(), F_DUPFD_CLOEXEC, 0);
+    if (duplicate < 0) throw std::system_error(errno, std::generic_category(), "duplicate direct memory backing");
+    *file = duplicate;
+    *offset = page->second.offset + phys % PS5_PAGE_SIZE;
+    return true;
 }
 #endif
 
@@ -579,6 +615,30 @@ bool Reserved(const void* addr, size_t len) {
     return false;
 }
 
+void UnmapRegistered(GuestAllocations::Mutation& mutation, void* addr, size_t len) {
+    mutation.Unmap(addr, len, [&](const void* piece, std::size_t pieceBytes, const void* allocation, bool last) {
+        auto* pieceAddress = const_cast<void*>(piece);
+        std::lock_guard lock(g_directLock);
+        EraseMappings(reinterpret_cast<std::uintptr_t>(piece), reinterpret_cast<std::uintptr_t>(piece) + pieceBytes);
+#if defined(__linux__)
+        Unmap(pieceAddress, pieceBytes);
+#else
+        if (KernelArena::Get().Contains(pieceAddress, pieceBytes)) munmap(pieceAddress, pieceBytes);
+        else if (last) munmap_release(const_cast<void*>(allocation));
+        else munmap(pieceAddress, pieceBytes);
+#endif
+    });
+    EraseReservations(addr, len);
+    RecordProtection(addr, len, -1);
+}
+
+void ReplaceFixedOverlap(GuestAllocations::Mutation& mutation, void* addr, size_t len, int flags) {
+    constexpr int GuestMapNoOverwrite = 0x80;
+    if (addr == nullptr || (flags & GuestMapFixedFlag) == 0) return;
+    if ((flags & GuestMapNoOverwrite) == 0 && mutation.Overlaps(addr, len)) UnmapRegistered(mutation, addr, len);
+    mutation.RequireAvailable(addr, len);
+}
+
 bool FixedNoOverwriteConflict(const GuestAllocations::Mutation& mutation, void* addr, size_t len, int flags) {
     constexpr int GuestMapNoOverwrite = 0x80;
     if (addr == nullptr || (flags & GuestMapFixedFlag) == 0 || (flags & GuestMapNoOverwrite) == 0) return false;
@@ -598,7 +658,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
         RecordProtection(*addr, len, prot);
         return 0;
     }
-    if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) mutation.RequireAvailable(*addr, len);
+    ReplaceFixedOverlap(mutation, *addr, len, flags);
     std::lock_guard lock(g_directLock);
     ValidatePhysicalRange(static_cast<std::uint64_t>(physStart), len);
     void* mapped = MapAligned(*addr, len, PROT_NONE, flags, alignment);
@@ -627,7 +687,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
         RecordProtection(*addr, len, prot);
         return 0;
     }
-    if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) mutation.RequireAvailable(*addr, len);
+    ReplaceFixedOverlap(mutation, *addr, len, flags);
     void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, PS5_PAGE_SIZE);
     try {
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
@@ -702,20 +762,7 @@ int DoMunmap(void* addr, size_t len) {
     Trace("unmap %p+0x%zx", addr, len);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || !addr) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
-    mutation.Unmap(addr, len, [&](const void* piece, std::size_t pieceBytes, const void* allocation, bool last) {
-        auto* pieceAddress = const_cast<void*>(piece);
-        std::lock_guard lock(g_directLock);
-        EraseMappings(reinterpret_cast<std::uintptr_t>(piece), reinterpret_cast<std::uintptr_t>(piece) + pieceBytes);
-#if defined(__linux__)
-        Unmap(pieceAddress, pieceBytes);
-#else
-        if (KernelArena::Get().Contains(pieceAddress, pieceBytes)) munmap(pieceAddress, pieceBytes);
-        else if (last) munmap_release(const_cast<void*>(allocation));
-        else munmap(pieceAddress, pieceBytes);
-#endif
-    });
-    EraseReservations(addr, len);
-    RecordProtection(addr, len, -1);
+    UnmapRegistered(mutation, addr, len);
     return 0;
 }
 
@@ -754,6 +801,10 @@ void CreateDirectMemoryBacking(int64_t start, size_t len, int memoryType) {
     for (std::size_t offset = 0; offset < len; offset += PS5_PAGE_SIZE) {
         if (g_physPages.contains(first + offset)) throw std::runtime_error("physical allocation overlaps live direct memory");
     }
+#if defined(__linux__)
+    static std::once_flag registered;
+    std::call_once(registered, [] { GuestArena::GuestArenaSetSharedBacking_nid_postfix(&SharedBacking); });
+#endif
     const auto backing = std::make_shared<PhysicalBacking>(len, memoryType);
     std::map<std::uint64_t, PhysicalPage> pages;
     for (std::size_t offset = 0; offset < len; offset += PS5_PAGE_SIZE) pages.emplace(first + offset, PhysicalPage{backing, offset});

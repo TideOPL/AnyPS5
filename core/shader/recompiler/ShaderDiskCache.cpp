@@ -80,7 +80,7 @@ static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: u
 static_assert(sizeof(BindingAllocationResult) == 120, "BindingAllocationResult changed: update the allocation encoder");
 static_assert(sizeof(ResourceSpecialization) == 72, "ResourceSpecialization changed: update BuildKey");
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16, "ResourceSpecialization::Buffer changed: update BuildKey");
-static_assert(sizeof(ResourceSpecialization::Image) == 44, "ResourceSpecialization::Image changed: update BuildKey");
+static_assert(sizeof(ResourceSpecialization::Image) == 48, "ResourceSpecialization::Image changed: update BuildKey");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
 #endif
 
@@ -413,6 +413,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.depthCompare);
         out.Value(image.cube);
         out.Value(image.r128);
+        out.Value(image.srgbDecode);
         out.Value(image.depthBits);
         out.Value(image.depthUnorm16);
         out.Value(image.packed);
@@ -505,6 +506,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.depthCompare);
         in.Value(image.cube);
         in.Value(image.r128);
+        in.Value(image.srgbDecode);
         in.Value(image.depthBits);
         in.Value(image.depthUnorm16);
         in.Value(image.packed);
@@ -827,6 +829,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, c
         out.Value(image.depthUnorm16);
         out.Value(image.packedFormat);
         out.Value(image.emulatedCompare);
+        out.Value(image.srgbDecode);
     });
     writer.Values(std::span<const std::uint32_t>(specialization.boundDescriptors));
     const auto& switches = switchKey();

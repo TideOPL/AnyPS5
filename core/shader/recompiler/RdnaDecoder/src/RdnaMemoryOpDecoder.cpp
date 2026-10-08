@@ -319,9 +319,12 @@ constexpr MemoryOpcodeInfo dsOpcodes[] = {
     {0x4du, RdnaOpcode::DsWriteB64, 2, 32, false, false, false},
     {0x4eu, RdnaOpcode::DsWrite2B64, 4, 32, false, false, false},
     {0x4fu, RdnaOpcode::DsWrite2st64B64, 4, 32, false, false, false},
+    {0x6eu, RdnaOpcode::DsWrxchg2RtnB64, 4, 32, false, false, false},
+    {0x6fu, RdnaOpcode::DsWrxchg2st64RtnB64, 4, 32, false, false, false},
     {0x76u, RdnaOpcode::DsReadB64, 2, 32, false, false, false},
     {0x77u, RdnaOpcode::DsRead2B64, 4, 32, false, false, false},
     {0x78u, RdnaOpcode::DsRead2st64B64, 4, 32, false, false, false},
+    {0x7eu, RdnaOpcode::DsCondxchg32RtnB64, 2, 32, false, false, false},
     {0xa0u, RdnaOpcode::DsWriteB8D16Hi, 1, 8, false, false, false},
     {0xa1u, RdnaOpcode::DsWriteB16D16Hi, 1, 16, false, false, false},
     {0xa2u, RdnaOpcode::DsReadU8D16, 1, 8, false, false, false},
@@ -524,6 +527,7 @@ bool isDsAtomicOpcode(RdnaOpcode opcode) {
         case RdnaOpcode::DsOrRtnB64:
         case RdnaOpcode::DsXorRtnB64:
         case RdnaOpcode::DsWrxchgRtnB64:
+        case RdnaOpcode::DsCondxchg32RtnB64:
         case RdnaOpcode::DsMinRtnF64:
         case RdnaOpcode::DsMaxRtnF64:
             return true;
@@ -535,6 +539,8 @@ std::uint32_t dsSourceCount(RdnaOpcode opcode) {
     switch (opcode) {
         case RdnaOpcode::DsWrxchg2RtnB32:
         case RdnaOpcode::DsWrxchg2st64RtnB32:
+        case RdnaOpcode::DsWrxchg2RtnB64:
+        case RdnaOpcode::DsWrxchg2st64RtnB64:
         case RdnaOpcode::DsWrite2B32:
         case RdnaOpcode::DsWrite2st64B32:
         case RdnaOpcode::DsWrite2B64:
@@ -903,16 +909,24 @@ RdnaInstruction DecodeRdnaDs(std::uint32_t programCounter, std::span<const std::
     if (gds && (info.opcode == RdnaOpcode::DsSwizzleB32 || info.opcode == RdnaOpcode::DsBpermuteB32 || info.opcode == RdnaOpcode::DsPermuteB32 || info.opcode == RdnaOpcode::DsWriteAddtidB32 || info.opcode == RdnaOpcode::DsReadAddtidB32)) {
         throw std::runtime_error("DS lane operation is available only for LDS");
     }
-    if (info.opcode == RdnaOpcode::DsWrxchg2RtnB32 || info.opcode == RdnaOpcode::DsWrxchg2st64RtnB32) {
+    if (info.opcode == RdnaOpcode::DsWrxchg2RtnB32 || info.opcode == RdnaOpcode::DsWrxchg2st64RtnB32 || info.opcode == RdnaOpcode::DsWrxchg2RtnB64 || info.opcode == RdnaOpcode::DsWrxchg2st64RtnB64) {
         if (offset0 == offset1) {
             throw std::runtime_error("DS write exchange of one location through both offsets is not supported");
         }
-        if (vdst == 255u) {
+        if (vdst + info.dataDwords > 256u) {
             throw std::runtime_error("DS write exchange destination register range overflow");
         }
     }
     if (info.opcode == RdnaOpcode::DsWriteAddtidB32 && data1 != 0u) {
         throw std::runtime_error("DS write addtid data1 operand is not supported");
+    }
+    if (info.opcode == RdnaOpcode::DsCondxchg32RtnB64) {
+        if (data0 + 2u > 256u) {
+            throw std::runtime_error("DS conditional exchange source register range overflow");
+        }
+        if (vdst + 2u > 256u) {
+            throw std::runtime_error("DS conditional exchange destination register range overflow");
+        }
     }
     if (info.opcode == RdnaOpcode::DsReadAddtidB32 && (data0 != 0u || data1 != 0u)) {
         throw std::runtime_error("DS read addtid data operands are not supported");
@@ -933,10 +947,10 @@ RdnaInstruction DecodeRdnaDs(std::uint32_t programCounter, std::span<const std::
     } else if (instruction.op == RdnaOpcode::DsWrite2st64B32 || instruction.op == RdnaOpcode::DsRead2st64B32 || instruction.op == RdnaOpcode::DsWrxchg2st64RtnB32) {
         instruction.memoryOffset = offset0 * 256u;
         instruction.secondaryOffset = offset1 * 256u;
-    } else if (instruction.op == RdnaOpcode::DsWrite2B64 || instruction.op == RdnaOpcode::DsRead2B64) {
+    } else if (instruction.op == RdnaOpcode::DsWrite2B64 || instruction.op == RdnaOpcode::DsRead2B64 || instruction.op == RdnaOpcode::DsWrxchg2RtnB64) {
         instruction.memoryOffset = offset0 * 8u;
         instruction.secondaryOffset = offset1 * 8u;
-    } else if (instruction.op == RdnaOpcode::DsWrite2st64B64 || instruction.op == RdnaOpcode::DsRead2st64B64) {
+    } else if (instruction.op == RdnaOpcode::DsWrite2st64B64 || instruction.op == RdnaOpcode::DsRead2st64B64 || instruction.op == RdnaOpcode::DsWrxchg2st64RtnB64) {
         instruction.memoryOffset = offset0 * 512u;
         instruction.secondaryOffset = offset1 * 512u;
     }

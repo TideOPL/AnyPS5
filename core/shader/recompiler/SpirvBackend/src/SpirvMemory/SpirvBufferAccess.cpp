@@ -12,23 +12,6 @@ namespace ShaderRecompiler
 {
 namespace {
 
-    const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(const SpirvEmitterState& state) {
-        switch (state.program.Resources().stage) {
-        case IrShaderStage::Compute:
-            if (state.inputInfo.compute == nullptr) {
-                FailEmit("compute input info is missing");
-            }
-            return state.inputInfo.compute;
-        case IrShaderStage::Mesh:
-            if (state.inputInfo.vertex == nullptr) {
-                FailEmit("vertex input info is missing");
-            }
-            return &state.inputInfo.vertex->mesh;
-        default:
-            return nullptr;
-        }
-    }
-
     void EnsureLdsStorage(SpirvEmitterState& state) {
         if (state.ldsVariable != 0) {
             return;
@@ -79,9 +62,7 @@ IrBufferFormat StorageBufferFormat(const SpirvEmitterState& state, const MemoryI
 
 void EmitMemoryOffsets(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
-    if (layout.memoryOffsetCount > state.memoryByteOffsets.size()) {
-        FailEmit("memory offset count exceeds the buffer limit");
-    }
+    state.memoryByteOffsets.assign(layout.memoryOffsetCount, 0u);
     for (std::uint32_t i = 0; i < layout.memoryOffsetCount; i++) {
         const auto word = EmitShaderDataDwordLoad(state, layout.memoryOffsetDword + i / 4u);
         const auto shift = ConstantU32(state, (i % 4u) * 8u);

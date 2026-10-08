@@ -831,9 +831,6 @@ private:
                 return i;
             }
         }
-        if (m_info.buffers.size() >= ShaderInfo::MaxBuffers) {
-            return std::numeric_limits<std::uint32_t>::max();
-        }
         BufferResource resource;
         resource.source = source;
         resource.firstUsePc = pc;
@@ -987,9 +984,6 @@ private:
             }
             GetHandle(inst.Argument(0), IrOpcode::GetBufferResource, 4, handle, source);
             resource = AddBuffer(source, memory, op, flags.pc);
-            if (resource == std::numeric_limits<std::uint32_t>::max()) {
-                fail("buffer resource limit exceeded");
-            }
             AddHandlePatch(handle, resource);
             AddMemoryPatch(flags.index, resource, 0, false);
             return;
