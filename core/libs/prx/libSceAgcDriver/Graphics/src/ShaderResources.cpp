@@ -568,17 +568,6 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
 std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes);
 
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
-    // A storage image over a depth surface is seeded from its depth plane and taken back into it; the
-    // stencil plane has neither (and no Vulkan storage view of a stencil format), so a store there
-    // would land in an image the depth surface never sees. Another extent at that address is aliased memory, not the plane.
-    // The plane is 8 bits wide, so a wider view is aliased memory too.
-    const auto viewedFormat = ResolveTextureFormat(viewed.format);
-    const bool eightBit = viewedFormat == VK_FORMAT_R8_UINT || viewedFormat == VK_FORMAT_R8_UNORM || viewedFormat == VK_FORMAT_R8_SINT || viewedFormat == VK_FORMAT_R8_SNORM;
-    if (eightBit && DepthStencilPlaneAt(viewed.baseAddress, viewed.width, viewed.height)) {
-        char text[192];
-        std::snprintf(text, sizeof(text), "storage access to a depth surface's stencil plane at 0x%llx (%ux%u, guest format %u) is not implemented", static_cast<unsigned long long>(viewed.baseAddress), viewed.width, viewed.height, viewed.format);
-        Require(false, text);
-    }
     auto texture = lookupStorageTexture(context, words, viewed, mip, guestBytes);
     if (DepthSurfaceAt(viewed.baseAddress)) SeedStorageFromDepth(context, texture);
     return texture;
