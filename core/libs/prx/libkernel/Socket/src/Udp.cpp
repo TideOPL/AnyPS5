@@ -2,6 +2,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <io.h>
+#include <cstdlib>
 #else
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -12,6 +14,9 @@
 #endif
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
+#ifdef _WIN32
+#include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
+#endif
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -180,6 +185,9 @@ bool GuestSockets::IsOpen(int descriptor) {
     return sockets.contains(descriptor);
 }
 
+#ifdef _WIN32
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+#endif
 namespace {
 #ifdef _WIN32
 using NativePollDescriptor = WSAPOLLFD;
@@ -206,6 +214,27 @@ std::shared_ptr<Socket> Find(int descriptor) {
     const auto found = sockets.find(descriptor);
     return found != sockets.end() ? found->second : nullptr;
 }
+void AddPollRequest(std::vector<NativePollDescriptor>& native, decltype(NativePollDescriptor::fd) value, short events) {
+    NativePollDescriptor request{};
+    request.fd = value;
+    for (const auto& flag : RequestFlags)
+        if (events & flag.guest) request.events = static_cast<short>(request.events | flag.native);
+    native.push_back(request);
+}
+#ifdef _WIN32
+constexpr short GuestPollVnodeReady = 0x1 | 0x4 | 0x40;
+void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
+short HostPollEvents(int descriptor, short events) {
+    if (File::DirectoryDescriptorPath(descriptor)) return static_cast<short>(events & GuestPollVnodeReady);
+    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
+    _set_thread_local_invalid_parameter_handler(previous);
+    if (handle == INVALID_HANDLE_VALUE) return GuestPollInvalid;
+    if (::GetFileType(handle) != FILE_TYPE_DISK)
+        throw std::runtime_error("poll: descriptor " + std::to_string(descriptor) + " is not a socket or a disk file");
+    return static_cast<short>(events & GuestPollVnodeReady);
+}
+#endif
 }
 
 extern "C" {
@@ -536,8 +565,16 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
         if (entry.descriptor < 0) continue;
         if ((entry.events & ~GuestPollAccepted) != 0)
             throw std::runtime_error("poll: unsupported event flags " + std::to_string(entry.events));
-        if (entry.descriptor < GuestSockets::FirstDescriptor)
-            throw std::runtime_error("poll: descriptor " + std::to_string(entry.descriptor) + " is not a socket");
+        if (entry.descriptor < GuestSockets::FirstDescriptor) {
+#ifdef _WIN32
+            entry.revents = HostPollEvents(entry.descriptor, entry.events);
+            if (entry.revents) ++ready;
+#else
+            AddPollRequest(native, entry.descriptor, entry.events);
+            owners.push_back(i);
+#endif
+            continue;
+        }
         auto socket = Find(entry.descriptor);
         if (!socket) {
             entry.revents = GuestPollInvalid;
@@ -547,11 +584,7 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
 #ifdef _WIN32
         if (entry.events & GuestPollPriority) throw std::runtime_error("poll: POLLPRI is not supported by WSAPoll");
 #endif
-        NativePollDescriptor request{};
-        request.fd = socket->value;
-        for (const auto& flag : RequestFlags)
-            if (entry.events & flag.guest) request.events = static_cast<short>(request.events | flag.native);
-        native.push_back(request);
+        AddPollRequest(native, socket->value, entry.events);
         owners.push_back(i);
         held.push_back(std::move(socket));
     }

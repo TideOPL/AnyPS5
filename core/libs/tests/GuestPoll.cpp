@@ -3,6 +3,15 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <string>
+#include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#include <sys/stat.h>
+#else
+#include <unistd.h>
+#endif
 struct PollDescriptor {
     int descriptor;
     short events;
@@ -23,9 +32,42 @@ int* APS5_VABI __error_nid_postfix();
 }
 static void Require(bool value) { if (!value) std::abort(); }
 constexpr short In = 0x1;
+constexpr short Priority = 0x2;
 constexpr short Out = 0x4;
 constexpr short Hup = 0x10;
 constexpr short Invalid = 0x20;
+constexpr short ReadNormal = 0x40;
+static int OpenHostFile(const std::filesystem::path& path) {
+#ifdef _WIN32
+    return ::_wopen(path.c_str(), _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
+    return ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+#endif
+}
+static void PollHostDescriptors(int listener) {
+    const auto path = std::filesystem::temp_directory_path()
+        / ("guest_poll_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".tmp");
+    const int file = OpenHostFile(path);
+    Require(file >= 0);
+    PollDescriptor disk[2]{{file, In | Priority | Out | ReadNormal, 0}, {listener, In, 0}};
+    Require(poll_nid_postfix(disk, 2, -1) == 1 && disk[0].revents == (In | Out | ReadNormal) && disk[1].revents == 0);
+    Require(close_nid_postfix(file) == 0);
+    Require(poll_nid_postfix(disk, 1, -1) == 1 && disk[0].revents == Invalid);
+    std::filesystem::remove(path);
+#ifndef _WIN32
+    int ends[2];
+    Require(::pipe(ends) == 0);
+    PollDescriptor channel[2]{{ends[0], In, 0}, {ends[1], Out, 0}};
+    Require(poll_nid_postfix(channel, 2, 0) == 1 && channel[0].revents == 0 && channel[1].revents == Out);
+    Require(::write(ends[1], "p", 1) == 1);
+    Require(poll_nid_postfix(channel, 1, 1000) == 1 && channel[0].revents == In);
+    char byte = 0;
+    Require(::read(ends[0], &byte, 1) == 1);
+    Require(close_nid_postfix(ends[1]) == 0);
+    Require(poll_nid_postfix(channel, 1, 1000) == 1 && (channel[0].revents & (In | Hup)) != 0);
+    Require(close_nid_postfix(ends[0]) == 0);
+#endif
+}
 int main() {
     const int listener = socket_nid_postfix(2, 1, 0);
     Require(listener >= 0);
@@ -61,6 +103,7 @@ int main() {
     Require(poll_nid_postfix(nullptr, 0, 10) == 0);
     Require(poll_nid_postfix(nullptr, 1, 0) == -1 && *__error_nid_postfix() == 14);
     Require(poll_nid_postfix(&single, 1, -2) == -1 && *__error_nid_postfix() == 22);
+    PollHostDescriptors(listener);
     Require(close_nid_postfix(server) == 0);
     Require(close_nid_postfix(listener) == 0);
 }
