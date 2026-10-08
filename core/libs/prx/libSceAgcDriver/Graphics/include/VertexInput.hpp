@@ -138,7 +138,7 @@ inline bool VertexFetchPastRawRange(const ShaderRecompiler::VertexAttribute& att
 }
 
 inline std::size_t VertexFetchInRangeBytes(const ShaderRecompiler::VertexAttribute& attribute) {
-    const std::size_t records = attribute.resource.fields[2] & ~3u;
+    const std::size_t records = (static_cast<std::size_t>(attribute.resource.fields[2]) + 3u) & ~std::size_t{3};
     return std::min<std::size_t>(records, DecodeVertexFormat(attribute).bytes);
 }
 
