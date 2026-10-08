@@ -147,13 +147,11 @@ static const bool g_timerSelfTest = [] {
 extern "C" {
 
 std::uint64_t APS5_VABI sceKernelGetProcessTime() {
-    const std::uint64_t start = GetStartNanos();
-    return (GetMonotonicNanos() - start) / 1000ULL;
+    return (GetMonotonicNanos() - GetStartNanos()) / 1000ULL;
 }
 
 std::uint64_t APS5_VABI sceKernelGetProcessTimeCounter() {
-    const std::uint64_t start = GetStartNanos();
-    return GetMonotonicNanos() - start;
+    return GetMonotonicNanos() - GetStartNanos();
 }
 
 std::uint64_t APS5_VABI sceKernelGetProcessTimeCounterFrequency() {
