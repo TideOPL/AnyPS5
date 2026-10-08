@@ -228,11 +228,8 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                     capability == spv::CapabilityPhysicalStorageBufferAddresses ||
                     capability == spv::CapabilitySampledImageArrayDynamicIndexing ||
                     capability == spv::CapabilityStorageImageArrayDynamicIndexing ||
-                    // Layered rendering: the vertex stage's render target index (gl_Layer out) and
-                    // the pixel stage reading it back (gl_Layer in, a Geometry capability).
                     capability == spv::CapabilityShaderLayer ||
-                    capability == spv::CapabilityShaderViewportIndex ||
-                    capability == spv::CapabilityGeometry;
+                    capability == spv::CapabilityShaderViewportIndex;
 
                 // Bindless image tables index their slots non-uniformly in graphics stages
                 // (VK_EXT_descriptor_indexing, enabled by the device setup when available).
