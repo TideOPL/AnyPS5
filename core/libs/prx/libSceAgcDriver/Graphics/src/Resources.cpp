@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <algorithm>
 #include <exception>
 
 namespace AgcDriver::Graphics {
@@ -18,6 +19,12 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         mapping = allocation->mapping;
         deviceAddress = allocation->address;
         allocationBytes = allocation->allocationBytes;
+        try {
+            if ((allocation->bufferBytes != 0 ? allocation->bufferBytes : allocation->bytes) != size) rebind();
+        } catch (...) {
+            release();
+            throw;
+        }
         ready = true;
         return;
     }
@@ -32,8 +39,9 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
         if (addressable) allocation.pNext = &flags;
-        allocation.allocationSize = requirements.size;
-        allocationBytes = requirements.size;
+        const VkDeviceSize alignment = std::max<VkDeviceSize>(requirements.alignment, 1);
+        allocation.allocationSize = std::max<VkDeviceSize>(requirements.size, (static_cast<VkDeviceSize>(capacity) + alignment - 1) / alignment * alignment);
+        allocationBytes = allocation.allocationSize;
         // The CPU reads most of these buffers back (write-back, diffs), which is very slow from
         // write-combined memory, so the default host properties prefer cached host memory.
         constexpr VkMemoryPropertyFlags hostDefault = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -57,13 +65,29 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
     }
 }
 
+void Buffer::rebind() {
+    context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+    buffer = VK_NULL_HANDLE;
+    deviceAddress = 0;
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = size;
+    info.usage = usage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    Check(context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer), "vkCreateBuffer");
+    VkMemoryRequirements requirements{};
+    context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
+    Require(requirements.size <= allocationBytes, "pooled buffer memory is smaller than its size class");
+    Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
+    initializeAddress(usage);
+}
+
 Buffer::~Buffer() {
     release();
 }
 
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties});
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, size});
         return;
     }
     if (mapping) context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, memory);
@@ -95,6 +119,24 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         buffer = allocation->buffer;
         memory = allocation->memory;
         allocationBytes = allocation->allocationBytes;
+        if (allocation->bufferBytes == 0 || allocation->bufferBytes == capacity) return;
+        context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+        buffer = VK_NULL_HANDLE;
+        try {
+            VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            info.size = capacity;
+            info.usage = usage;
+            info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            Check(context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer), "vkCreateBuffer device");
+            VkMemoryRequirements requirements{};
+            context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
+            Require(requirements.size <= allocationBytes, "pooled buffer memory is smaller than its size class");
+            Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
+        } catch (...) {
+            cache.reset();
+            release();
+            throw;
+        }
         return;
     }
     try {

@@ -22,6 +22,8 @@ public:
 
 private:
     void initializeAddress(VkBufferUsageFlags usage);
+    // Over memory taken from the pool: a new VkBuffer of exactly `size` bound to it.
+    void rebind();
     void release() noexcept;
     Context context;
     VkDeviceAddress deviceAddress = 0;

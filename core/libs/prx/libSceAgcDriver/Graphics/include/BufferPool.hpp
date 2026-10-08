@@ -22,6 +22,9 @@ struct BufferAllocation {
     std::size_t bytes;
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    // Size the VkBuffer itself was created with: the size its last user asked for (robust accesses
+    // past it must not reach the rest of the class-sized memory), 0 when that is `bytes`.
+    std::size_t bufferBytes = 0;
 };
 
 // Released buffer allocations kept for reuse, since creating, binding and mapping one costs tens of
