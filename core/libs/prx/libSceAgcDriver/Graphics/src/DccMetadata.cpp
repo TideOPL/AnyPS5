@@ -478,7 +478,7 @@ void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes) 
     StoreUncompressedOnCpu(metaAddress, count);
 }
 
-void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
+void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std::uint64_t surfaceBytes, bool keysCleared) {
     const auto count = static_cast<std::size_t>(surfaceBytes / KeyBytes);
     if (metaAddress == 0 || count == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count, true)) return;
     auto* recorder = CpuKeysOnly() || !GuestMemory::GpuMutex().HeldByThisThread() ? nullptr : Recorder::Active();
@@ -489,7 +489,7 @@ void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std:
     // after it may write clear keys, and nothing orders inside a batch, so a fresh fill is recorded
     // (idempotent, no wait) rather than trusting the earlier one.
     const bool pending = recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count);
-    if (!pending && AlreadyUncompressed(metaAddress, count)) return;
+    if (!pending && !keysCleared && AlreadyUncompressed(metaAddress, count)) return;
     if (recorder != nullptr && StoreUncompressedOnGpu(context, *recorder, metaAddress, count)) return;
     StoreUncompressedOnCpu(metaAddress, count);
 }

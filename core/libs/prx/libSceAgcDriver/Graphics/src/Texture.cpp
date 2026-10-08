@@ -2220,7 +2220,7 @@ bool StorageTexture::overlaps(std::uint64_t address, std::size_t bytes) const {
 void StorageTexture::MarkDirty() {
     if (descriptor.dccAddress != 0 && IsDccClear(uploadedKeys) && !IsDccClear(filledKeys)) {
         traceKeyStore("first write", descriptor, guestBytes);
-        MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+        MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, true);
         uploadedKeys = DccKeys::Uncompressed;
     }
     markLayersPending(0, trackedLayers);
