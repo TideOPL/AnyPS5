@@ -266,6 +266,7 @@ struct GraphicsCompileContext {
     std::optional<MeshConfiguration> mesh;
     std::optional<TessellationConfiguration> tessellation;
     GraphicsDrawParameters draw;
+    std::uint32_t vertexOutputControl = 0;
 };
 
 struct RecompileRequest {

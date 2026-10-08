@@ -28,6 +28,7 @@ struct ShaderStages {
     std::uint32_t fragmentWaveSize;
     std::optional<ShaderRecompiler::MeshConfiguration> mesh;
     std::optional<ShaderRecompiler::TessellationConfiguration> tessellation;
+    std::uint32_t vertexOutputControl = 0;
 };
 
 struct ColorTarget {

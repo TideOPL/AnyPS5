@@ -793,6 +793,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->imageInt64Atomics = true;
         state->spirvExtensions.push_back("SPV_EXT_shader_image_int64");
     }
+    // Layered rendering from a vertex or tessellation evaluation stage (a 3D or array target drawn
+    // one slice per instance) writes Layer, which SPIR-V below 1.5 reaches through this extension.
+    if (hasExtension(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME)) {
+        deviceExtensions.push_back(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
+        state->capabilities.push_back(spv::CapabilityShaderViewportIndexLayerEXT);
+        state->spirvExtensions.push_back("SPV_EXT_shader_viewport_index_layer");
+    }
     deviceExtensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
     state->capabilities.push_back(spv::CapabilitySignedZeroInfNanPreserve);
     state->spirvExtensions.push_back("SPV_KHR_float_controls");

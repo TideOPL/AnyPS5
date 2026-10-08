@@ -102,8 +102,15 @@ void DefineModule(SpirvEmitterState& state) {
         state.module.EmitCapability(spv::CapabilityCullDistance);
     }
     if (state.layerVariable != 0) {
-        state.module.RequireVersion(0x00010500u);
-        state.module.EmitCapability(spv::CapabilityShaderLayer);
+        // Below SPIR-V 1.5 a vertex or tessellation evaluation stage writes Layer through
+        // SPV_EXT_shader_viewport_index_layer (VK_EXT_shader_viewport_index_layer on the device).
+        if (std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityShaderViewportIndexLayerEXT)) != state.supportedCapabilities.end()) {
+            state.module.EmitCapability(spv::CapabilityShaderViewportIndexLayerEXT);
+            state.module.EmitExtension("SPV_EXT_shader_viewport_index_layer");
+        } else {
+            state.module.RequireVersion(0x00010500u);
+            state.module.EmitCapability(spv::CapabilityShaderLayer);
+        }
     }
     if (InputVariableForKind(state, StageInputKind::Layer) != 0) {
         state.module.EmitCapability(spv::CapabilityGeometry);

@@ -61,6 +61,7 @@ std::string vteMessage(std::uint32_t viewportControl) {
 // Render target index, viewport index and the misc export vector that carries them are accepted but
 // not routed: color targets are single-layer, so layered draws land in layer 0.
 constexpr std::uint32_t LayerExports = (1u << 18u) | (1u << 19u) | (1u << 21u) | (1u << 24u);
+constexpr std::uint32_t VertexLayerExports = (1u << 18u) | (1u << 21u);
 constexpr std::uint32_t DepthControlMask = ~0x007007f0u;
 // EXEC_ON_HIER_FAIL / EXEC_ON_NOOP / EXEC_IF_OVERLAPPED (bits 9, 10, 17) only force the pixel shader
 // to run, which it always does here.
@@ -432,6 +433,9 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
         const auto threads = std::max({(groupPrimitives - 1u) * inputStep + inputSize, primitives, maxVertices, primitives * (verticesPerPrimitive - 2u)});
         result.mesh = ShaderRecompiler::MeshConfiguration{primitive, groupPrimitives, (groupPrimitives - 1u) * inputStep + inputSize, maxVertices, primitives * (verticesPerPrimitive - 2u), ((threads + result.vertexWaveSize - 1u) / result.vertexWaveSize) * result.vertexWaveSize, ((resources >> 19u) & 0xffu) * 128u, 0, esgsItemSize};
     }
+    // The layer of a layered render comes from the misc vector's Z (PA_CL_VS_OUT_CNTL
+    // USE_VTX_RENDER_TARGET_INDX and VS_OUT_MISC_VEC_ENA); a viewport index stays unsupported.
+    result.vertexOutputControl = read(queue.context, 0x207) & VertexLayerExports;
     return result;
 }
 
@@ -459,7 +463,7 @@ State DecodeState(const QueueState& queue) {
     }
     APS5_LOG_OUT_DEBUG("Topology=%u", static_cast<unsigned>(result.topology));
     result.primitiveRestart = read(queue.userConfig, 0x24b, RegisterBank::UserConfig) != 0 && !result.rectList && result.topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
-    if ((read(cx, 0x207) & LayerExports) != 0) {
+    if ((read(cx, 0x207) & LayerExports & ~VertexLayerExports) != 0) {
         static bool reported = false;
         if (!reported) {
             reported = true;

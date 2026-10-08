@@ -642,6 +642,12 @@ void verifyMeshConfiguration() {
     other.graphics = GraphicsCompileContext{0u, {}, otherMesh, std::nullopt, {}};
     RecompileCacheKey::Build(other, key);
     require(key != first && RecompileCacheKey::ContextHash(request) != RecompileCacheKey::ContextHash(other), "the cache keys ignore the mesh configuration");
+    auto layered = request;
+    layered.graphics->vertexOutputControl = (1u << 18u) | (1u << 21u);
+    const auto layeredReplay = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(layered));
+    require(layeredReplay.request.graphics.has_value() && layeredReplay.request.graphics->vertexOutputControl == layered.graphics->vertexOutputControl, "the layer export control was lost in serialization");
+    RecompileCacheKey::Build(layered, key);
+    require(key != first && RecompileCacheKey::ContextHash(request) != RecompileCacheKey::ContextHash(layered), "the cache keys ignore the layer export control");
 }
 
 ShaderRecompiler::ShaderPixelStageInfo twoParameterPixel() {
@@ -756,12 +762,12 @@ void verifyPixelRequestSerialization() {
     minimal.context.waveSize = 64;
     minimal.context.pixel = ShaderPixelStageInfo{};
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQQoAAAA=", "new requests did not use serialization version 10");
+    require(requestPrefix(encoded, 8u) == "NVNQQQsAAAA=", "new requests did not use serialization version 11");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 162u;
     for (std::size_t bytes = 0; bytes < 8u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated version-8 pixel mapping was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQQsAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQQwAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
 }

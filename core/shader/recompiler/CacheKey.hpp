@@ -31,6 +31,7 @@ public:
         append(key, request.context.pixel);
         append(key, request.context.vertex);
         appendMesh(key, request);
+        append(key, request.graphics ? request.graphics->vertexOutputControl : 0u);
         append(key, request.target);
         append(key, DebugProbeActive());
         append(key, RayTracingStrict());
@@ -52,6 +53,7 @@ public:
         append(key, request.context.pixel);
         append(key, request.context.vertex);
         appendMesh(key, request);
+        append(key, request.graphics ? request.graphics->vertexOutputControl : 0u);
         std::uint64_t hash = 0xcbf29ce484222325ull;
         for (const auto value : key) {
             hash ^= value;

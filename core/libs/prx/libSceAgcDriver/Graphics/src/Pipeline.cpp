@@ -429,6 +429,7 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
         append(key, mesh.ldsSizeDwords);
         append(key, mesh.provokingVertex);
     }
+    append(key, state.stages.vertexOutputControl);
     append(key, state.stages.tessellation.has_value());
     if (state.stages.tessellation) {
         const auto& tessellation = *state.stages.tessellation;

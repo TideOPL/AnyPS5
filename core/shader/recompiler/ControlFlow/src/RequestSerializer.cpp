@@ -697,7 +697,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(10u);
+    writer.WriteU32(11u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -715,6 +715,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.nonConstantImageOffsets);
     writer.WriteU32(request.target.srgbDecodeFormats);
     if (request.context.compute.has_value()) writer.WriteU32(request.context.compute->scratchDwords);
+    if (request.graphics.has_value()) writer.WriteU32(request.graphics->vertexOutputControl);
     return base64Encode(buffer);
 }
 
@@ -723,7 +724,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 10u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 11u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);
@@ -742,6 +743,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     if (version >= 6u) result.request.target.nonConstantImageOffsets = reader.ReadBool();
     if (version >= 9u) result.request.target.srgbDecodeFormats = reader.ReadU32();
     if (version >= 10u && result.request.context.compute.has_value()) result.request.context.compute->scratchDwords = reader.ReadU32();
+    if (version >= 11u && result.request.graphics.has_value()) result.request.graphics->vertexOutputControl = reader.ReadU32();
     return result;
 }
 
