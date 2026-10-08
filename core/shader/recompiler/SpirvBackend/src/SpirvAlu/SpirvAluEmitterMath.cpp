@@ -567,7 +567,14 @@ std::uint32_t EmitReadLane(SpirvValueEmitContext& ctx, const IrValue& inst) {
         // contribute 0, so a lane of the upper half reads 0. APS5_STRICT_READLANE=1 refuses it.
         static const bool strict = std::getenv("APS5_STRICT_READLANE") != nullptr;
         const bool unlaunchedHalf = !strict && state.program.Resources().stage == IrShaderStage::Vertex && state.hostSubgroupSize == 32u && index >= 32u;
-        if (unlaunchedHalf) return ConstantU32(state, 0u);
+        if (unlaunchedHalf) {
+            // The same idiom ORs the halves' masks when the reduction is a mask of the lanes whose
+            // vertices accepted primitives use (NGG culling): one invocation per vertex is no wave,
+            // so every vertex stays used, which all-ones bits in the missing half give.
+            const auto& uses = inst.Uses();
+            const bool orMask = !uses.empty() && std::all_of(uses.begin(), uses.end(), [](const IrValue* use) { return use->Opcode() == IrOpcode::BitwiseOr32; });
+            return ConstantU32(state, orMask ? 0xffffffffu : 0u);
+        }
         if (index >= state.hostSubgroupSize) FailOutsideHostSubgroup(ctx, inst, "v_readlane_b32 of lane " + std::to_string(index));
     }
     const auto lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, state.program.WaveSize() - 1u));
