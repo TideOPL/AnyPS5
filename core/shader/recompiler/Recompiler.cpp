@@ -110,7 +110,21 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     const auto inputInfo = RequestInputInfo(request);
 
     constexpr RdnaInstructionDecoder decoder;
-    const auto decoded = decoder.Decode(request.shader.code);
+    // DBG: DBG_PATCH_WORD=<word index>:<hex value>,... replaces code words of the program DBG_FORCE_EXPORT_CODE marks.
+    std::vector<std::uint32_t> patchedCode;
+    if (const char* patches = std::getenv("DBG_PATCH_WORD"); patches != nullptr && DbgTranslatingCode() == 0xf0f0f0f0f0ull) {
+        patchedCode.assign(request.shader.code.begin(), request.shader.code.end());
+        for (const char* text = patches; *text != '\0';) {
+            char* end = nullptr;
+            const auto index = std::strtoul(text, &end, 10);
+            if (end == text || *end != ':') break;
+            const auto value = static_cast<std::uint32_t>(std::strtoul(end + 1, &end, 16));
+            if (index < patchedCode.size()) patchedCode[index] = value;
+            std::fprintf(stderr, "[dbg] patched code word %lu to %08x\n", index, value);
+            text = *end == ',' ? end + 1 : end;
+        }
+    }
+    const auto decoded = decoder.Decode(patchedCode.empty() ? request.shader.code : std::span<const std::uint32_t>(patchedCode));
 
     constexpr GraphBuilder graphBuilder;
     auto cfg = graphBuilder.Build(decoded);

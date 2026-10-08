@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassTrace.hpp"
 #include <cstdio>
+#include <cstring>
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -530,9 +531,41 @@ bool DepthStencilPlaneAt(std::uint64_t address, std::uint32_t width, std::uint32
 
 namespace AgcDriver::Graphics {
 
+std::vector<float> DbgProbeDepthSurface(std::uint64_t address, std::span<const std::pair<float, float>> points) {
+    std::lock_guard lock(surfacesMutex());
+    const auto matches = std::count_if(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.address == address; });
+    for (auto it = surfaces().rbegin(); it != surfaces().rend(); ++it) {
+        const auto& surface = *it;
+        if (surface->target.address != address) continue;
+        if (matches > 1) std::fprintf(stderr, "[pass] depth probe sees %zu surfaces at 0x%llx, newest %ux%u\n", static_cast<std::size_t>(matches), static_cast<unsigned long long>(address), surface->target.extent.width, surface->target.extent.height);
+        if (surface->target.format == VK_FORMAT_D16_UNORM || surface->target.format == VK_FORMAT_D16_UNORM_S8_UINT) return {};
+        const auto& context = surface->context;
+        auto readback = std::make_unique<Buffer>(context, points.size() * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CommandBatch batch(context);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        std::vector<VkBufferImageCopy> copies;
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            VkBufferImageCopy copy{};
+            copy.bufferOffset = i * 4u;
+            copy.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+            copy.imageOffset = {static_cast<std::int32_t>(points[i].first * static_cast<float>(surface->target.extent.width - 1u)), static_cast<std::int32_t>(points[i].second * static_cast<float>(surface->target.extent.height - 1u)), 0};
+            copy.imageExtent = {1, 1, 1};
+            copies.push_back(copy);
+        }
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), surface->image, VK_IMAGE_LAYOUT_GENERAL, readback->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        std::vector<float> values(points.size());
+        std::memcpy(values.data(), readback->Bytes().data(), values.size() * 4u);
+        return values;
+    }
+    return {};
+}
+
 void DbgDumpDepthSurface(std::uint64_t address, const char* name) {
     std::lock_guard lock(surfacesMutex());
-    for (const auto& surface : surfaces()) {
+    for (auto it = surfaces().rbegin(); it != surfaces().rend(); ++it) {
+        const auto& surface = *it;
         if (surface->target.address != address) continue;
         const auto& context = surface->context;
         const bool d16 = surface->target.format == VK_FORMAT_D16_UNORM || surface->target.format == VK_FORMAT_D16_UNORM_S8_UINT;

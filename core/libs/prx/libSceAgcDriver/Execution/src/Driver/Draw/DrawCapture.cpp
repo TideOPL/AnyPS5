@@ -109,6 +109,22 @@ ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::u
                     bytes += text;
                 }
                 std::fprintf(stderr, "[peek]   user[%zu] 0x%llx:%s\n", j, static_cast<unsigned long long>(address), bytes.c_str());
+                // DBG_PEEK_DEEP=1: also the contents (as floats) of each buffer V# in a 0x100-byte table there.
+                if (std::getenv("DBG_PEEK_DEEP") != nullptr && GuestMemory::Accessible(reinterpret_cast<const void*>(address), 256)) {
+                    const auto* table = reinterpret_cast<const std::uint32_t*>(address);
+                    for (std::size_t slot = 0; slot + 4 <= 64; slot += 4) {
+                        const auto base = table[slot] | (static_cast<std::uint64_t>(table[slot + 1] & 0xffffu) << 32u);
+                        const auto records = table[slot + 2];
+                        if (base < 0x100000000ull || records < 16 || records > 0x10000 || !GuestMemory::Accessible(reinterpret_cast<const void*>(base), std::min<std::size_t>(records, 1024))) continue;
+                        std::string floats;
+                        for (std::size_t k = 0; k < std::min<std::size_t>(records / 4, 256); ++k) {
+                            char text[20];
+                            std::snprintf(text, sizeof(text), " %g", reinterpret_cast<const float*>(base)[k]);
+                            floats += text;
+                        }
+                        std::fprintf(stderr, "[peek]     table+0x%zx V# 0x%llx (%u bytes):%s\n", slot * 4, static_cast<unsigned long long>(base), records, floats.c_str());
+                    }
+                }
                 std::lock_guard peekLock(Graphics::SubmitPeekMutex());
                 if (const auto found = Graphics::SubmitPeeks().find(address); found != Graphics::SubmitPeeks().end()) {
                     std::string then;

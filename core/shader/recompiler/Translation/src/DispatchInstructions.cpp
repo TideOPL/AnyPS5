@@ -114,7 +114,7 @@ DebugProbe DebugProbeConfig() {
         return result;
     }();
     DebugProbe probe = parsed;
-    probe.enabled = parsed.enabled && DebugProbeActive();
+    probe.enabled = parsed.enabled && (DebugProbeActive() || DbgTranslatingCode() == 0xf0f0f0f0f0ull);
     return probe;
 }
 

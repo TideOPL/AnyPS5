@@ -591,14 +591,19 @@ void storageCensus(const Context& context, StorageTextureCache& cache) {
     static const double after = std::getenv("DBG_STORAGE_CENSUS_S") ? std::atof(std::getenv("DBG_STORAGE_CENSUS_S")) : -1.0;
     static const auto started = std::chrono::steady_clock::now();
     static bool done = false;
+    static int censusSequence = -1;
     const bool requested = DbgCensusRequested().exchange(false);
     if (!requested && (after < 0 || done || std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() < after)) return;
     done = true;
+    ++censusSequence;
     if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Sync();
     int rank = 0;
     for (const auto& entry : cache.entries) {
         const auto& texture = *entry.texture;
         const auto& descriptor = texture.Descriptor();
+        // DBG_CENSUS_MINW=<n>: only images at least that wide.
+        static const std::uint32_t censusMinWidth = std::getenv("DBG_CENSUS_MINW") ? static_cast<std::uint32_t>(std::atoi(std::getenv("DBG_CENSUS_MINW"))) : 0u;
+        if (descriptor.width < censusMinWidth) continue;
         // DBG_CENSUS_ADDRS=<hex>,<hex>...: only those addresses (any size), past the 80 cap.
         static const std::string only = std::getenv("DBG_CENSUS_ADDRS") ? std::string(",") + std::getenv("DBG_CENSUS_ADDRS") + "," : std::string();
         static const bool traced = std::getenv("DBG_CENSUS_TRACED") != nullptr;
@@ -629,7 +634,7 @@ void storageCensus(const Context& context, StorageTextureCache& cache) {
         context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
         batch.SubmitAndWait();
         char name[128];
-        std::snprintf(name, sizeof(name), "census_%03d_%llx_%ux%u_vk%d.raw", rank++, static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, static_cast<int>(texture.StorageFormat()));
+        std::snprintf(name, sizeof(name), "census_s%02d_%03d_%llx_%ux%u_m%u_vk%d.raw", censusSequence, rank++, static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, static_cast<int>(texture.StorageFormat()));
         if (std::FILE* file = std::fopen(name, "wb")) {
             const std::uint32_t header[4] = {descriptor.width, descriptor.height, static_cast<std::uint32_t>(texture.StorageFormat()), elementBytes};
             std::fwrite(header, sizeof(header), 1, file);
@@ -2455,7 +2460,25 @@ void ShaderResources::addImageBinding(const ShaderRecompiler::DescriptorBinding&
             try {
                 const auto resource = DecodeTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords));
                 PassTraceNote(resource.baseAddress);
-                std::fprintf(stderr, "[pass] %lu   %s 0x%llx %ux%u fmt %u dim %d mips %u-%u\n", static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 1000u), binding.kind == ShaderRecompiler::DescriptorKind::StorageImage ? "write" : "read ", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), resource.baseLevel, resource.lastLevel);
+                // DBG_DEPTH_READ_DUMP=<n>: dump the depth surface behind the first n traced reads of a depth-tiled (tile 4) image.
+                static const int depthReadMax = std::getenv("DBG_DEPTH_READ_DUMP") ? std::atoi(std::getenv("DBG_DEPTH_READ_DUMP")) : 0;
+                static std::atomic<int> depthReads{0};
+                if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage && static_cast<unsigned>(resource.tileMode) == 4u && depthReads.load() < depthReadMax) {
+                    char name[96];
+                    std::snprintf(name, sizeof(name), "depthread_%03d_%llx.raw", depthReads.fetch_add(1) + 1, static_cast<unsigned long long>(resource.baseAddress));
+                    if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Sync();
+                    DbgDumpDepthSurface(resource.baseAddress, name);
+                    std::fprintf(stderr, "[pass] depth read dump %s\n", name);
+                }
+                // DBG_DEPTH_READ_PROBE=1: print the depth at a few points at every traced read of a depth-tiled image.
+                static const bool depthReadProbe = std::getenv("DBG_DEPTH_READ_PROBE") != nullptr;
+                if (depthReadProbe && binding.kind == ShaderRecompiler::DescriptorKind::SampledImage && static_cast<unsigned>(resource.tileMode) == 4u) {
+                    if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Sync();
+                    static const std::array<std::pair<float, float>, 4> points{{{0.3f, 0.1f}, {0.5f, 0.4f}, {0.6f, 0.1f}, {0.6f, 0.6f}}};
+                    const auto values = DbgProbeDepthSurface(resource.baseAddress, points);
+                    if (values.size() == points.size()) std::fprintf(stderr, "[pass] depth read probe 0x%llx T# %ux%u: %g %g %g %g\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, values[0], values[1], values[2], values[3]);
+                }
+                std::fprintf(stderr, "[pass] %lu   %s 0x%llx %ux%u fmt %u dim %d mips %u-%u of %u alloc %u tile %u dcc 0x%llx\n", static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 1000u), binding.kind == ShaderRecompiler::DescriptorKind::StorageImage ? "write" : "read ", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), resource.baseLevel, resource.lastLevel, resource.mipCount, resource.allocatedMipCount, static_cast<unsigned>(resource.tileMode), static_cast<unsigned long long>(resource.dccAddress));
             } catch (...) {
             }
         }

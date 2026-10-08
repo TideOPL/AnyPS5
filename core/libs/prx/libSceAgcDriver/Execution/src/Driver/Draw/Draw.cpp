@@ -322,6 +322,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 direct.firstVertex = indirect.indxOffset;
             }
             if (graphics.rectList) {
+                if (static const bool skipRects = std::getenv("DBG_SKIP_INDIRECT_RECTS") != nullptr; skipRects) continue;
                 direct.indexCount -= direct.indexCount % 3u;
                 if (direct.indexCount == 0) continue;
             }

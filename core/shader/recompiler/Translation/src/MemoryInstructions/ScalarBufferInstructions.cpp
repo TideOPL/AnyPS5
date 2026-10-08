@@ -1,5 +1,9 @@
 #include "Translation/MemoryInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
+#include "Recompiler.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <array>
 #include <stdexcept>
 
@@ -44,6 +48,19 @@ bool TranslationContext::sLoad(const RdnaInstruction& inst, bool raw) {
             loaded[component] = &ir.Emit(IrOpcode::LoadAddressU32, IrOpcodeType(IrOpcode::LoadAddressU32), {resource, &offset.Value(), &ir.Constant(0u), &ir.ConstantBool(true)}, flags);
         } else {
             loaded[component] = &ir.Emit(IrOpcode::ReadConstBuffer, IrOpcodeType(IrOpcode::ReadConstBuffer), {resource, &offset.Value()}, flags);
+        }
+    }
+    // DBG_SLOAD_SCALE=<base sgpr>:<component>:<factor>: in the program DBG_FORCE_EXPORT_CODE marks, a constant
+    // buffer load through that descriptor reads that dword times the factor.
+    if (static const char* scaleText = std::getenv("DBG_SLOAD_SCALE"); scaleText != nullptr && !raw && DbgTranslatingCode() == 0xf0f0f0f0f0ull) {
+        unsigned base = 0, index = 0;
+        float factor = 1.0f;
+        if (std::sscanf(scaleText, "%u:%u:%f", &base, &index, &factor) == 3 && baseCode == base && index < memory.dataDwords) {
+            std::uint32_t bits = 0;
+            std::memcpy(&bits, &factor, sizeof(bits));
+            auto& scaled = ir.Emit(IrOpcode::FPMul32, IrType::F32, {&ir.BitCastF32(*loaded[index]), &ir.BitCastF32(ir.Constant(bits))});
+            loaded[index] = &ir.BitCastU32(scaled);
+            std::fprintf(stderr, "[dbg] scaled s_buffer_load s%u component %u by %g\n", base, index, factor);
         }
     }
     for (std::uint32_t component = 0u; component < memory.dataDwords; ++component) {

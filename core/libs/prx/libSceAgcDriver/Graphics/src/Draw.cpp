@@ -1617,7 +1617,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             });
         }
         if (binding.resident != nullptr) {
-            if (PassTraceActive()) std::fprintf(stderr, "[pass]   target %zu 0x%llx %ux%u dcc 0x%llx -> image %p\n", index, static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.dccAddress), static_cast<const void*>(binding.resident.get()));
+            if (PassTraceActive()) std::fprintf(stderr, "[pass]   target %zu 0x%llx %ux%u slices %u+%u of %u dcc 0x%llx -> image %p\n", index, static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, color.depthSlice, color.layerCount, color.depth, static_cast<unsigned long long>(color.dccAddress), static_cast<const void*>(binding.resident.get()));
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
             targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layerCount));
@@ -1803,7 +1803,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // DBG_PREPASS_DUMP_MAX=<n>: dump the depth plane after the first n depth-writing draws without color targets (at least 1920 wide) in the trace window.
         static const int prepassMax = std::getenv("DBG_PREPASS_DUMP_MAX") ? std::atoi(std::getenv("DBG_PREPASS_DUMP_MAX")) : 0;
         static int prepassDumped = 0;
-        if (PassTraceActive() && prepassDumped < prepassMax && state.colors.empty() && state.depth && state.depthWrite && state.depth->extent.width >= 1920) {
+        if (PassTraceActive() && prepassDumped < prepassMax && state.colors.empty() && state.depth && state.depthWrite && state.depth->extent.width >= 1920 && state.depth->extent.width <= 4096 && state.depth->extent.height >= 1080) {
             ++prepassDumped;
             if (recorder != nullptr) recorder->Sync();
             char depthName[96];
@@ -1811,19 +1811,29 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             DbgDumpDepthSurface(state.depth->address, depthName);
             std::fprintf(stderr, "[pass] prepass dump %s\n", depthName);
         }
+        // DBG_DEPTH_PROBE=1: after each depth-writing draw in the trace window, print the depth at a few points of the surface.
+        static const bool depthProbe = std::getenv("DBG_DEPTH_PROBE") != nullptr;
+        if (depthProbe && PassTraceActive() && state.depth && state.depthWrite) {
+            if (recorder != nullptr) recorder->Sync();
+            static const std::array<std::pair<float, float>, 4> points{{{0.3f, 0.1f}, {0.5f, 0.4f}, {0.7f, 0.1f}, {0.7f, 0.6f}}};
+            const auto values = DbgProbeDepthSurface(state.depth->address, points);
+            if (values.size() == points.size()) std::fprintf(stderr, "[pass] depth probe 0x%llx n%u i%u: %g %g %g %g\n", static_cast<unsigned long long>(state.depth->address), draw.indexCount, draw.instanceCount, values[0], values[1], values[2], values[3]);
+        }
         // DBG_AFTERDRAW_VK=<VkFormat> / DBG_AFTERDRAW_MAX=<n>: dump target 0 after the first n draws of that format in the trace window.
         static const int afterDrawFormat = std::getenv("DBG_AFTERDRAW_VK") ? std::atoi(std::getenv("DBG_AFTERDRAW_VK")) : static_cast<int>(VK_FORMAT_A2B10G10R10_UNORM_PACK32);
         static const int afterDrawMax = std::getenv("DBG_AFTERDRAW_MAX") ? std::atoi(std::getenv("DBG_AFTERDRAW_MAX")) : 1;
         static const std::size_t afterDrawTargets = std::getenv("DBG_AFTERDRAW_VK") ? 1u : 2u;
         static const std::size_t afterDrawSlot = std::getenv("DBG_AFTERDRAW_SLOT") ? std::strtoull(std::getenv("DBG_AFTERDRAW_SLOT"), nullptr, 10) : 0u;
+        static const std::uint32_t afterDrawCount = std::getenv("DBG_AFTERDRAW_COUNT") ? static_cast<std::uint32_t>(std::atoi(std::getenv("DBG_AFTERDRAW_COUNT"))) : 0u;
         static int afterDrawDumped = 0;
-        if (PassTraceActive() && afterDrawDumped < afterDrawMax && targets.size() > afterDrawSlot && targets.size() >= afterDrawTargets && targets[afterDrawSlot].resident != nullptr && static_cast<int>(targets[afterDrawSlot].resident->StorageFormat()) == afterDrawFormat) {
+        if (PassTraceActive() && afterDrawDumped < afterDrawMax && (afterDrawCount == 0 || draw.indexCount == afterDrawCount) && targets.size() > afterDrawSlot && targets.size() >= afterDrawTargets && targets[afterDrawSlot].resident != nullptr && (afterDrawFormat < 0 || static_cast<int>(targets[afterDrawSlot].resident->StorageFormat()) == afterDrawFormat)) {
             ++afterDrawDumped;
             if (recorder != nullptr) recorder->Sync();
             auto& image = *targets[afterDrawSlot].resident;
             const auto& descriptor = image.Descriptor();
             const auto elementBytes = BytesPerElement(descriptor.format);
-            const std::size_t bytes = static_cast<std::size_t>(descriptor.width) * descriptor.height * elementBytes;
+            static const std::uint32_t afterDrawSlices = std::getenv("DBG_AFTERDRAW_SLICES") ? static_cast<std::uint32_t>(std::atoi(std::getenv("DBG_AFTERDRAW_SLICES"))) : 1u;
+            const std::size_t bytes = static_cast<std::size_t>(descriptor.width) * descriptor.height * elementBytes * afterDrawSlices;
             auto readback = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             CommandBatch batch(context);
             VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -1832,7 +1842,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
             VkBufferImageCopy copy{};
             copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            copy.imageExtent = {descriptor.width, descriptor.height, 1};
+            copy.imageExtent = {descriptor.width, descriptor.height, afterDrawSlices};
             context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(batch.Handle(), image.Image(), VK_IMAGE_LAYOUT_GENERAL, readback->Handle(), 1, &copy);
             VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1848,7 +1858,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 std::fclose(file);
             }
             std::fprintf(stderr, "[pass] after-draw dump %s (%s)\n", name, recorded ? "recorded" : "synchronous");
-            if (afterDrawTargets == 2u) DbgCensusRequested() = true;
+            if (afterDrawTargets == 2u || std::getenv("DBG_AFTERDRAW_CENSUS") != nullptr) DbgCensusRequested() = true;
             if (std::getenv("DBG_AFTERDRAW_DEPTH") != nullptr && state.depth) {
                 std::snprintf(name, sizeof(name), "afterdepth_%03d_%llx_%ux%u.raw", afterDrawDumped, static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height);
                 DbgDumpDepthSurface(state.depth->address, name);

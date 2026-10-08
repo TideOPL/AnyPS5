@@ -628,6 +628,8 @@ State DecodeState(const QueueState& queue) {
         result.blends[color.exportIndex] = state;
     }
     if (!result.colors.empty()) result.blend = result.blends[result.colors.front().exportIndex];
+    // DBG_NO_DEPTH_BOUNDS=1: draws ignore the depth bounds test.
+    if (static const bool noBounds = std::getenv("DBG_NO_DEPTH_BOUNDS") != nullptr; noBounds) result.depthBoundsTest = false;
     // DBG_DEPTH_RELAX=1: depth-read-only draws into four or more color targets test ALWAYS.
     if (static const bool relax = std::getenv("DBG_DEPTH_RELAX") != nullptr; relax && result.depthTest && !result.depthWrite && result.colors.size() >= 4) result.depthCompare = VK_COMPARE_OP_ALWAYS;
     APS5_LOG_OUT_DEBUG("DecodeState done colorTarget=%u render=%ux%u topology=%u", result.hasColorTarget ? 1u : 0u, result.renderExtent.width, result.renderExtent.height, static_cast<unsigned>(result.topology));

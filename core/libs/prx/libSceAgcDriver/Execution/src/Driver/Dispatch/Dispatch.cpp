@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -41,6 +42,47 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         localDevice = device;
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
+    static std::atomic<bool> constCensusArmed{false};
+    if (constCensusArmed.exchange(false)) Graphics::DbgCensusRequested() = true;
+    // DBG_CONST_DUMP_CODE=<hex word>,...: for the first dispatch of the program starting with those words, save the
+    // buffers of the V#s at user[8..11] and at offset 0x60 of the table user[12..13] points to (consts_<a|b>.bin).
+    if (static const std::vector<std::uint32_t> constWords = [] {
+            std::vector<std::uint32_t> words;
+            if (const char* text = std::getenv("DBG_CONST_DUMP_CODE")) {
+                for (char* end = nullptr; *text != '\0'; text = *end == ',' ? end + 1 : end) {
+                    words.push_back(static_cast<std::uint32_t>(std::strtoul(text, &end, 16)));
+                    if (end == text) break;
+                }
+            }
+            return words;
+        }(); !constWords.empty() && userData.size() >= 14 && snapshot.code.size() >= codeOffset + constWords.size() && std::equal(constWords.begin(), constWords.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(codeOffset))) {
+        static std::atomic<bool> dumped{false};
+        static std::atomic<int> seen{0};
+        static const int skip = std::getenv("DBG_CONST_DUMP_SKIP") ? std::atoi(std::getenv("DBG_CONST_DUMP_SKIP")) : 0;
+        if (seen.fetch_add(1) >= skip && !dumped.exchange(true)) {
+            const auto save = [](const char* name, const std::uint32_t* vsharp) {
+                const auto base = vsharp[0] | (static_cast<std::uint64_t>(vsharp[1] & 0xffffu) << 32u);
+                const auto stride = (vsharp[1] >> 16u) & 0x3fffu;
+                const auto bytes = std::min<std::uint64_t>(static_cast<std::uint64_t>(vsharp[2]) * std::max(stride, 1u), 1u << 20u);
+                if (std::FILE* file = std::fopen(name, "wb")) {
+                    std::fwrite(reinterpret_cast<const void*>(base), 1, bytes, file);
+                    std::fclose(file);
+                }
+                std::fprintf(stderr, "[dbg] const dump %s base 0x%llx bytes %llu\n", name, static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
+            };
+            static const bool noSave = std::getenv("DBG_CONST_DUMP_NOSAVE") != nullptr;
+            static const bool onlyA = std::getenv("DBG_CONST_DUMP_ONLY_A") != nullptr;
+            if (!noSave || onlyA) save("consts_a.bin", userData.data() + 8);
+            const auto table = userData[12] | (static_cast<std::uint64_t>(userData[13] & 0xffffu) << 32u);
+            if (!noSave && !onlyA) save("consts_b.bin", reinterpret_cast<const std::uint32_t*>(table + 0x60u));
+            const auto* first = reinterpret_cast<const std::uint32_t*>(table);
+            const auto depthAddress = (static_cast<std::uint64_t>(first[0]) | (static_cast<std::uint64_t>(first[1] & 0xffu) << 32u)) << 8u;
+            if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Sync();
+            if (!noSave && !onlyA) Graphics::DbgDumpDepthSurface(depthAddress, "consts_depth.raw");
+            std::fprintf(stderr, "[dbg] const dump depth 0x%llx\n", static_cast<unsigned long long>(depthAddress));
+            constCensusArmed = true;
+        }
+    }
     // DBG_DISPATCH_CODE=<hex address>: print the program's first 48 words and its user data, once.
     if (static const std::uint64_t dbgCode = std::getenv("DBG_DISPATCH_CODE") ? std::strtoull(std::getenv("DBG_DISPATCH_CODE"), nullptr, 16) : 0; dbgCode == address) {
         static std::atomic<int> printed{0};
@@ -288,6 +330,39 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             state = 2;
             Graphics::DbgCensusRequested() = true;
         } else if (state.load() == 0 && address == censusAfter && Graphics::PassTraceActive()) state = 1;
+    }
+    // DBG_CENSUS_AFTER_CODE=<hex word>,<hex word>...: the same, for the program whose code starts with those words.
+    if (static const std::vector<std::uint32_t> censusWords = [] {
+            std::vector<std::uint32_t> words;
+            if (const char* text = std::getenv("DBG_CENSUS_AFTER_CODE")) {
+                for (char* end = nullptr; *text != '\0'; text = *end == ',' ? end + 1 : end) {
+                    words.push_back(static_cast<std::uint32_t>(std::strtoul(text, &end, 16)));
+                    if (end == text) break;
+                }
+            }
+            return words;
+        }(); !censusWords.empty()) {
+        static std::atomic<int> state{0};
+        if (state.load() == 1) {
+            state = 2;
+            Graphics::DbgCensusRequested() = true;
+        } else if (state.load() == 0 && Graphics::PassTraceActive() && std::equal(censusWords.begin(), censusWords.end(), reinterpret_cast<const std::uint32_t*>(address))) {
+            state = 1;
+            std::fprintf(stderr, "[pass] census armed after code match 0x%llx\n", static_cast<unsigned long long>(address));
+        }
+    }
+    // DBG_CENSUS_AFTER_GROUPS=<x>x<y> (DBG_CENSUS_AFTER_MAX=<n>, default 8): a census at the dispatch
+    // after each traced dispatch of that group count.
+    if (static const char* groupText = std::getenv("DBG_CENSUS_AFTER_GROUPS"); groupText != nullptr) {
+        static const std::pair<std::uint32_t, std::uint32_t> wanted = [] { unsigned x = 0, y = 0; std::sscanf(std::getenv("DBG_CENSUS_AFTER_GROUPS"), "%ux%u", &x, &y); return std::pair<std::uint32_t, std::uint32_t>{x, y}; }();
+        static const int limit = std::getenv("DBG_CENSUS_AFTER_MAX") ? std::atoi(std::getenv("DBG_CENSUS_AFTER_MAX")) : 8;
+        static std::atomic<bool> armed{false};
+        static std::atomic<int> taken{0};
+        if (armed.exchange(false)) Graphics::DbgCensusRequested() = true;
+        if (Graphics::PassTraceActive() && packet[1] == wanted.first && packet[2] == wanted.second && taken.fetch_add(1) < limit) {
+            armed = true;
+            std::fprintf(stderr, "[pass] census armed after dispatch 0x%llx (#%d)\n", static_cast<unsigned long long>(address), taken.load());
+        }
     }
     if (Graphics::PassTraceActive()) std::fprintf(stderr, "[pass] %lu dispatch 0x%llx queue 0x%x groups %ux%ux%u\n", static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 1000u), static_cast<unsigned long long>(address), submission.queue, groups[0], groups[1], groups[2]);
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
