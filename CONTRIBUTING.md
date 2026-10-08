@@ -16,7 +16,7 @@
 
 ## Build and test
 
-Toolchains are listed in the [README](README.md#build).
+Toolchains are listed in the [build instructions](docs/dev/BUILD.md).
 
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
@@ -25,6 +25,12 @@ ctest --test-dir build --output-on-failure
 ```
 
 Python 3 is optional; without it some relinker tests are not registered.
+
+The Conventions check runs on every pull request and fails when a rule on this page is broken. It accepts code comments only when the pull request also changes [TechnicalDebt](docs/dev/TechnicalDebt.md), and only UTF-8 text files. Run it locally before pushing:
+
+```
+python3 tools/check_conventions.py --base origin/main
+```
 
 ## Branches and pull requests
 

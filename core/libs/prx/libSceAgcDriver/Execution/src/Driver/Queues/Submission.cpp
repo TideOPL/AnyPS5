@@ -43,6 +43,23 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
         }
         reach(cursor, cursor + count);
         const auto opcode = (header >> 8u) & 0xffu;
+        if (opcode == 0x3fu && count == 14) {
+            const auto mode = guest[cursor + 1] & 3u;
+            require(mode == 1u || mode == 2u, "invalid COND_INDIRECT_BUFFER mode");
+            require(((guest[cursor + 1] >> 8u) & 7u) == 0u, "a COND_INDIRECT_BUFFER with a comparison is not implemented");
+            require(!Pm4::Predicated(header), "a predicated COND_INDIRECT_BUFFER is not implemented");
+            const auto* target = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(guest[cursor + 8] & ~3u) | (static_cast<std::uintptr_t>(guest[cursor + 9] & 0xffffu) << 32u));
+            const std::size_t targetWords = guest[cursor + 10] & 0xfffffu;
+            if (targetWords != 0) {
+                GuestMemory::CheckRange(target, targetWords * sizeof(std::uint32_t), alignof(std::uint32_t));
+                if (copySegment(submission, target, targetWords, budget)) {
+                    require(guarded.empty(), "a REWIND inside a conditional execution range is not implemented");
+                    return true;
+                }
+            }
+            cursor += count;
+            continue;
+        }
         if (opcode == 0x3fu) {
             require(count == 4, "invalid INDIRECT_BUFFER size");
             const auto* target = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(guest[cursor + 1] & ~3u) | (static_cast<std::uintptr_t>(guest[cursor + 2] & 0xffffu) << 32u));
@@ -84,6 +101,19 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
     reach(words, words);
     require(guarded.empty(), "conditional execution range exceeds its command buffer");
     return false;
+}
+
+void Driver::readRegisterLists(Submission& submission) {
+    submission.registerLists.clear();
+    for (std::size_t cursor = 0; cursor < submission.commands.size(); cursor += Pm4::PacketWords(submission.commands[cursor])) {
+        const auto header = submission.commands[cursor];
+        if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
+        try {
+            submission.registerLists.emplace(cursor, Pm4::ReadIndirectRegisters(std::span<const std::uint32_t>(submission.commands).subspan(cursor, Pm4::PacketWords(header))));
+        } catch (const std::exception& error) {
+            throw std::runtime_error("AGC driver: " + Pm4::Name(header) + " at DWORD " + std::to_string(cursor) + ": " + error.what());
+        }
+    }
 }
 
 void Driver::waitForFlipRoom(const Submission& submission) {
@@ -142,6 +172,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
     tail.queue = stalled.queue;
     copyCommands(tail, stalled.rewindTail, stalled.rewindWords);
     validate(tail, stalled.rewindTail);
+    readRegisterLists(tail);
     waitForFlipRoom(tail);
     {
         std::lock_guard lock(mutex);
@@ -173,6 +204,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     }
     const auto copied = profile ? std::chrono::steady_clock::now() : start;
     validate(submission, descriptor.addr);
+    readRegisterLists(submission);
     waitForFlipRoom(submission);
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));
