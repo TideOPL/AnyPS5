@@ -1,3 +1,4 @@
+#include <chrono>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -17,6 +18,32 @@ ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::u
     using Stage = ShaderRecompiler::ShaderStage;
     phaseTiming.Phase(DrawRowVectors);
     const auto& program = programs[i];
+    // DBG_SKIP_CODE=<hex word>,...[;<hex word>,...]: draws with a program starting with any of those word lists are rejected.
+    static const std::vector<std::vector<std::uint32_t>> skipCodes = [] {
+        std::vector<std::vector<std::uint32_t>> lists;
+        if (const char* text = std::getenv("DBG_SKIP_CODE")) {
+            lists.emplace_back();
+            for (char* end = nullptr; *text != '\0';) {
+                const auto word = static_cast<std::uint32_t>(std::strtoul(text, &end, 16));
+                if (end == text) break;
+                lists.back().push_back(word);
+                text = end;
+                if (*text == ';') lists.emplace_back();
+                if (*text == ',' || *text == ';') ++text;
+            }
+        }
+        return lists;
+    }();
+    static const double skipUntil = std::getenv("DBG_SKIP_UNTIL") ? std::atof(std::getenv("DBG_SKIP_UNTIL")) : 1e9;
+    static const auto skipStarted = std::chrono::steady_clock::now();
+    const bool skipActive = std::chrono::duration<double>(std::chrono::steady_clock::now() - skipStarted).count() < skipUntil;
+    for (const auto& words : skipActive ? skipCodes : std::vector<std::vector<std::uint32_t>>{}) {
+        const auto& code = program.snapshot->code;
+        if (!words.empty() && code.size() >= program.codeOffset + words.size() && std::equal(words.begin(), words.end(), code.begin() + static_cast<std::ptrdiff_t>(program.codeOffset))) {
+            rejected = "DBG_SKIP_CODE";
+            return {};
+        }
+    }
     const auto waveSize = program.binary.stage == Stage::Fragment ? graphics.stages.fragmentWaveSize : graphics.stages.vertexWaveSize;
     ShaderRecompiler::RecompileRequest request{
         program.binary,

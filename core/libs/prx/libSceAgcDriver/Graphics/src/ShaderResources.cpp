@@ -1003,12 +1003,18 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                         // vector) counts as written, like imageWritten below.
                         const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
                         const bool atomic = element < binding.bufferAtomic.size() && binding.bufferAtomic[element];
+                        if (written && DbgCollectWrites()) {
+                            const auto* w = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4;
+                            const auto wstride = (w[1] >> 16u) & 0x3fffu;
+                            DbgWrittenBuffers().push_back({w[0] | (static_cast<std::uint64_t>(w[1] & 0xffffu) << 32u), wstride != 0 ? static_cast<std::uint64_t>(w[2]) * wstride : static_cast<std::uint64_t>(w[2])});
+                        }
                         if (written && PassTraceActive()) {
                             const auto* v = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4;
                             const auto base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xffffu) << 32u);
                             const auto stride = (v[1] >> 16u) & 0x3fffu;
                             const auto bytes = stride != 0 ? static_cast<std::uint64_t>(v[2]) * stride : static_cast<std::uint64_t>(v[2]);
-                            if (bytes >= (256u << 10u)) std::fprintf(stderr, "[pass] %lu   wbuf  0x%llx +0x%llx stride %u\n", static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 1000u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), stride);
+                            static const std::uint64_t wbufMin = std::getenv("DBG_WBUF_MIN") ? std::strtoull(std::getenv("DBG_WBUF_MIN"), nullptr, 10) : (256u << 10u);
+                            if (bytes >= wbufMin) std::fprintf(stderr, "[pass] %lu   wbuf  0x%llx +0x%llx stride %u\n", static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 1000u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), stride);
                         }
                         const auto index = addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic);
                         const auto& push = shader.program->pushConstants;
@@ -2673,6 +2679,62 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
             }
             if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element));
+            // DBG_HZB_CLEAR=1: clear sampled R16F pyramids (10+ mips, 1024+ wide) to 0 before use (nothing occludes in a reversed-Z HZB).
+            // DBG_HZB_DUMP_S=<s>: once, after <s> seconds, write every mip of the first sampled pyramid as hzb_<addr>_m<k>.raw.
+            static const double hzbDumpAfter = std::getenv("DBG_HZB_DUMP_S") ? std::atof(std::getenv("DBG_HZB_DUMP_S")) : -1.0;
+            static const auto hzbStarted = std::chrono::steady_clock::now();
+            static std::atomic<int> hzbDumped{0};
+            if (hzbDumpAfter >= 0 && resource.format == 13u && resource.mipCount >= 10u && resource.width >= (std::getenv("DBG_HZB_DUMP_W") ? static_cast<std::uint32_t>(std::atoi(std::getenv("DBG_HZB_DUMP_W"))) : 1024u) && std::chrono::duration<double>(std::chrono::steady_clock::now() - hzbStarted).count() >= hzbDumpAfter && texture->StorageSource() != nullptr && hzbDumped.fetch_add(1) < 2) {
+                if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Sync();
+                const auto* source = texture->StorageSource();
+                for (std::uint32_t mip = 0; mip < resource.mipCount; ++mip) {
+                    const auto mw = std::max(1u, resource.width >> mip), mh = std::max(1u, resource.height >> mip);
+                    const std::size_t bytes = static_cast<std::size_t>(mw) * mh * 2u;
+                    auto readback = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                    CommandBatch batch(context);
+                    VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+                    context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+                    VkBufferImageCopy copy{};
+                    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+                    copy.imageExtent = {mw, mh, 1};
+                    context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(batch.Handle(), source->Image(), VK_IMAGE_LAYOUT_GENERAL, readback->Handle(), 1, &copy);
+                    VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+                    context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+                    batch.SubmitAndWait();
+                    char name[128];
+                    std::snprintf(name, sizeof(name), "hzb_%llx_m%02u_%ux%u.raw", static_cast<unsigned long long>(resource.baseAddress), mip, mw, mh);
+                    if (std::FILE* file = std::fopen(name, "wb")) {
+                        const std::uint32_t header[4] = {mw, mh, 76u, 2u};
+                        std::fwrite(header, sizeof(header), 1, file);
+                        std::fwrite(readback->Bytes().data(), 1, bytes, file);
+                        std::fclose(file);
+                    }
+                }
+                std::fprintf(stderr, "[hzb] dumped 0x%llx %ux%u, %u mips (image mips %u)\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.mipCount, source->Descriptor().mipCount);
+            }
+            static const bool hzbClear = std::getenv("DBG_HZB_CLEAR") != nullptr;
+            static const long hzbQueue = std::getenv("DBG_HZB_CLEAR_QUEUE") ? std::strtol(std::getenv("DBG_HZB_CLEAR_QUEUE"), nullptr, 16) : -1;
+            static const double hzbFrom = std::getenv("DBG_HZB_CLEAR_FROM") ? std::atof(std::getenv("DBG_HZB_CLEAR_FROM")) : 0.0;
+            static const double hzbTo = std::getenv("DBG_HZB_CLEAR_TO") ? std::atof(std::getenv("DBG_HZB_CLEAR_TO")) : 1e9;
+            const double hzbNow = std::chrono::duration<double>(std::chrono::steady_clock::now() - hzbStarted).count();
+            if (hzbClear && hzbNow >= hzbFrom && hzbNow < hzbTo && (hzbQueue < 0 || static_cast<long>(DbgCurrentQueue()) == hzbQueue) && resource.format == 13u && resource.mipCount >= 10u && resource.width >= 1024u) {
+                auto* recorder = Recorder::Active();
+                const auto* source = texture->StorageSource();
+                static std::atomic<int> reported{0};
+                if (recorder != nullptr && source != nullptr) {
+                    const auto commands = recorder->Commands();
+                    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+                    context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+                    const VkClearColorValue zero{};
+                    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+                    context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, source->Image(), VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+                    VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+                    context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+                    if (reported.fetch_add(1) < 4) std::fprintf(stderr, "[hzb] cleared 0x%llx %ux%u mips %u\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.mipCount);
+                } else if (reported.fetch_add(1) < 4) {
+                    std::fprintf(stderr, "[hzb] could not clear 0x%llx (recorder %d, storage view %d)\n", static_cast<unsigned long long>(resource.baseAddress), recorder != nullptr && recorder->Recording(), source != nullptr);
+                }
+            }
             if (element < binding.imageUnnormalized.size() && binding.imageUnnormalized[element]) {
                 const auto range = texture->SampledViewRange(firstLayer);
                 const bool singleLevel = range.levels == 1u && range.layers == 1u && resource.baseLevel == 0u && EffectiveMinLod(resource) == 0.0f;

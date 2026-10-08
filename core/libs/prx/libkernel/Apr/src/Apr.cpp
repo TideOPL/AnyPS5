@@ -521,6 +521,13 @@ void _execute(const Apr::CommandBufferObject& buffer) {
         Apr::CommandHeader header;
         std::memcpy(&header, buffer.base + cursor, sizeof(header));
         if (header.bytes < sizeof(header) || cursor + header.bytes > buffer.offset) throw std::runtime_error("APR: malformed command");
+        {
+            static const bool traceOps = std::getenv("DBG_APR_TRACE") != nullptr;
+            static std::array<std::atomic<std::uint32_t>, 256> seen{};
+            const auto op = static_cast<std::uint32_t>(header.opcode) & 0xffu;
+            const auto count = traceOps ? seen[op].fetch_add(1) + 1 : 0u;
+            if (traceOps && (count == 1 || count == 100 || count == 10000)) std::fprintf(stderr, "[apr] opcode %u x%u\n", op, count);
+        }
         switch (header.opcode) {
         case Apr::Opcode::Nop:
         case Apr::Opcode::PushMarker:

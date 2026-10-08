@@ -7,6 +7,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <cstdlib>
+#include <cstring>
+#include <chrono>
+#include <atomic>
+#include <cstdio>
 #include <stdexcept>
 #include <thread>
 #include "prx/libSceAgcDriver/Graphics/include/PassTrace.hpp"
@@ -362,6 +366,37 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (Graphics::PassTraceActive() && packet[1] == wanted.first && packet[2] == wanted.second && taken.fetch_add(1) < limit) {
             armed = true;
             std::fprintf(stderr, "[pass] census armed after dispatch 0x%llx (#%d)\n", static_cast<unsigned long long>(address), taken.load());
+        }
+    }
+    Graphics::DbgCurrentQueue() = submission.queue;
+    {
+        static const char* dumpGroups = std::getenv("DBG_DUMP_GROUPS");
+        static const double dumpAfter = std::getenv("DBG_DUMP_S") ? std::atof(std::getenv("DBG_DUMP_S")) : 0.0;
+        static const auto dumpStarted = std::chrono::steady_clock::now();
+        static std::atomic<bool> dumpArmed{false};
+        auto& pending = Graphics::DbgWrittenBuffers();
+        if (Graphics::DbgCollectWrites() && !pending.empty()) {
+            Graphics::DbgCollectWrites() = false;
+            for (const auto& [base, bytes] : pending) {
+                if (bytes == 0 || bytes > (64ull << 20u) || !GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes))) continue;
+                GuestMemory::FlushGpuWrites(base, static_cast<std::size_t>(bytes));
+                char name[96];
+                std::snprintf(name, sizeof(name), "dbgbuf_%llx_%llx.bin", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
+                if (std::FILE* file = std::fopen(name, "wb")) {
+                    std::fwrite(reinterpret_cast<const void*>(base), 1, static_cast<std::size_t>(bytes), file);
+                    std::fclose(file);
+                }
+                std::fprintf(stderr, "[dbgdump] wrote %s\n", name);
+            }
+            pending.clear();
+        }
+        if (dumpGroups != nullptr && !dumpArmed.load() && std::chrono::duration<double>(std::chrono::steady_clock::now() - dumpStarted).count() >= dumpAfter) {
+            char text[48];
+            std::snprintf(text, sizeof(text), "%ux%ux%u", groups[0], groups[1], groups[2]);
+            if (std::strcmp(text, dumpGroups) == 0 && !dumpArmed.exchange(true)) {
+                Graphics::DbgCollectWrites() = true;
+                std::fprintf(stderr, "[dbgdump] armed on dispatch 0x%llx groups %s\n", static_cast<unsigned long long>(address), text);
+            }
         }
     }
     if (Graphics::PassTraceActive()) std::fprintf(stderr, "[pass] %lu dispatch 0x%llx queue 0x%x groups %ux%ux%u\n", static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 1000u), static_cast<unsigned long long>(address), submission.queue, groups[0], groups[1], groups[2]);

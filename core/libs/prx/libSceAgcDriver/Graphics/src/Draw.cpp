@@ -737,7 +737,9 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         GuestMemory::FlushGpuWrites(address, bytes);
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
-        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
+        // DBG_NO_DRAW_SNAPSHOT=1: every draw input is read fresh from guest memory.
+        static const bool noSnapshotReuse = std::getenv("DBG_NO_DRAW_SNAPSHOT") != nullptr;
+        if (copy.generation != 0 && !noSnapshotReuse) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
         if (copy.buffer != nullptr) {
             copy.reused = true;
             return copy;
@@ -1813,7 +1815,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
         // DBG_DEPTH_PROBE=1: after each depth-writing draw in the trace window, print the depth at a few points of the surface.
         static const bool depthProbe = std::getenv("DBG_DEPTH_PROBE") != nullptr;
-        if (depthProbe && PassTraceActive() && state.depth && state.depthWrite) {
+        // DBG_DEPTH_PROBE_QUERY=1: also at depth-tested, non-writing draws without color targets (occlusion queries).
+        static const bool queryProbe = std::getenv("DBG_DEPTH_PROBE_QUERY") != nullptr;
+        if ((depthProbe || queryProbe) && PassTraceActive() && state.depth && (state.depthWrite ? depthProbe : (queryProbe && state.colors.empty() && state.depthTest))) {
             if (recorder != nullptr) recorder->Sync();
             static const std::array<std::pair<float, float>, 4> points{{{0.3f, 0.1f}, {0.5f, 0.4f}, {0.7f, 0.1f}, {0.7f, 0.6f}}};
             const auto values = DbgProbeDepthSurface(state.depth->address, points);

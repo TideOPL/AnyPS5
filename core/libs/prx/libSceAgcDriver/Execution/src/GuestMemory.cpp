@@ -443,6 +443,8 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetSerial.fetch_add(1, std::memory_order_release);
     Pages().forget(address, bytes);
     forgetSerial.fetch_add(1, std::memory_order_release);
+    static const bool markRemapped = std::getenv("DBG_REMAP_MARK") != nullptr;
+    if (markRemapped) MarkWritten(address, bytes);
 }
 
 void PageStates::initialize() {

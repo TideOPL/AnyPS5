@@ -1,3 +1,4 @@
+#include <atomic>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -185,7 +186,9 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     static const bool drawDrain = std::getenv("APS5_DRAW_DRAIN") != nullptr;
     drawPacket = Pm4::DrawOpcode(opcode);
     sampleDump = opcode == 0x46 && (packet[1] & 0x3fu) == 0x39u;
-    if (sampleDump && !drainAll) {
+    // DBG_SAMPLES_ALWAYS_VISIBLE=1: occlusion counter dumps take the CPU path, which reports a growing count.
+    static const bool samplesVisible = std::getenv("DBG_SAMPLES_ALWAYS_VISIBLE") != nullptr;
+    if (sampleDump && !drainAll && !samplesVisible) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         if (const auto localDevice = device.Load()) {
@@ -255,6 +258,9 @@ void Driver::dumpSampleCounters(std::uint64_t address) {
         samples = recorder->SamplesTotal();
     }
     constexpr std::uint64_t ready = 1ull << 63u;
+    static const bool samplesVisible = std::getenv("DBG_SAMPLES_ALWAYS_VISIBLE") != nullptr;
+    static std::atomic<std::uint64_t> fakeSamples{0};
+    if (samplesVisible) samples = fakeSamples.fetch_add(1000000) + 1000000;
     for (std::uint64_t db = 0; db < 16; ++db) {
         const std::uint64_t value = ready | (db == 0 ? samples : 0u);
         GuestMemory::Write(address + db * 16u, std::as_bytes(std::span(&value, 1)), 8);
