@@ -2414,12 +2414,18 @@ void StorageTexture::FlushAllPending(const char* reason) {
 std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t address, std::uint64_t bytes) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
+    // An image of exactly this surface wins over a longer chain at the same address: transient
+    // surfaces alias (the DOF reduce's mip chain and the foreground layer written after it), and
+    // the chain's image holds the older results under its own DCC keys.
+    StorageTexture* containing = nullptr;
     for (auto* texture : pending.textures) {
+        if (texture->descriptor.baseAddress != address || texture->guestBytes < bytes) continue;
+        if (texture->guestBytes == bytes) return texture->weak_from_this().lock();
         // Containment, not equality: a descriptor of a chain's first mips (its own guestBytes are
         // shorter) is served by the chain's image; CanCopyFrom then checks the geometry.
-        if (texture->descriptor.baseAddress == address && texture->guestBytes >= bytes) return texture->weak_from_this().lock();
+        if (containing == nullptr) containing = texture;
     }
-    return nullptr;
+    return containing != nullptr ? containing->weak_from_this().lock() : nullptr;
 }
 
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except) {
