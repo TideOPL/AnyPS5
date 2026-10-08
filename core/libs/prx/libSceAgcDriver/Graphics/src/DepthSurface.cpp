@@ -425,6 +425,12 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         const auto viewed = ResolveTextureFormat(resource.format);
         const bool eightBit = viewed == VK_FORMAT_R8_UNORM || viewed == VK_FORMAT_R8_SNORM || viewed == VK_FORMAT_R8_UINT || viewed == VK_FORMAT_R8_SINT || viewed == VK_FORMAT_R8_SRGB;
         if (eightBit && resource.baseAddress == (*found)->target.address) return nullptr; // no depth plane is 8 bits wide, so this is memory reuse too
+        // A view of the depth plane in a format that cannot hold it (a colour target reusing the
+        // memory, R11G11B10 over a 384x384 D32S8 surface say) is memory reuse as well.
+        const bool d16Plane = (*found)->target.format == VK_FORMAT_D16_UNORM || (*found)->target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const bool depthBits = words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16Plane ? 16u : 32u);
+        const bool planeFormat = d16Plane ? (viewed == VK_FORMAT_R16_UNORM || viewed == VK_FORMAT_R16_UINT) : (viewed == VK_FORMAT_R32_SFLOAT || viewed == VK_FORMAT_R32_UINT);
+        if (resource.baseAddress == (*found)->target.address && !planeFormat && !depthBits) return nullptr;
     }
     (*found)->ApplyFastClear();
     (*found)->TakeWrites();
