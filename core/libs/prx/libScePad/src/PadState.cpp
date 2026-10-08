@@ -129,7 +129,7 @@ PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uin
         orientation = Quat{};
         biasIntegral[0] = biasIntegral[1] = biasIntegral[2] = 0.0f;
     }
-    lastFuseTime = std::max(lastFuseTime, now);
+    lastFuseTime = now;
     data.orientation_x = orientation.x;
     data.orientation_y = orientation.y;
     data.orientation_z = orientation.z;
@@ -183,14 +183,15 @@ int Pad::Read(PadData* data, int num) {
     std::lock_guard lock(stateMutex);
     if (failure) std::rethrow_exception(failure);
     if (!initialized) throw std::runtime_error("Pad: read before initialization");
+    const std::uint64_t now = sceKernelGetProcessTime();
     if (queue.empty()) {
-        data[0] = BuildData(state, timestamp, sceKernelGetProcessTime());
+        data[0] = BuildData(state, timestamp, now);
         return 1;
     }
     int count = 0;
     while (count < num && !queue.empty()) {
         const QueuedInput& entry = queue.front();
-        data[count++] = BuildData(entry.input, entry.timestamp, entry.timestamp);
+        data[count++] = BuildData(entry.input, entry.timestamp, now);
         queue.pop_front();
     }
     return count;
