@@ -17,6 +17,8 @@
 
 namespace AgcDriver::DriverDetail {
 
+int& DbgAfterHashPackets();
+
 template <typename TWork>
 void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
     static thread_local WorkerProfile profile;
@@ -115,6 +117,13 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        if (int& after = DbgAfterHashPackets(); after > 0) {
+            --after;
+            char line[256];
+            int length = std::snprintf(line, sizeof(line), "[after]   %s", Pm4::Name(header).c_str());
+            for (std::size_t i = 1; i < count && i < 8 && length < 200; ++i) length += std::snprintf(line + length, sizeof(line) - length, " %08x", packet[i]);
+            std::fprintf(stderr, "%s\n", line);
+        }
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
         if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
 
@@ -301,6 +310,11 @@ void Driver::execute(const Submission& submission) {
                         countSkip(Graphics::DrawSkip::Prechecked);
                     } else if (verdict == DrawVerdict::Nothing) {
                         countSkip(Graphics::DrawSkip::Nothing);
+                        if (static const bool traceNothing = std::getenv("DBG_TRACE_NOTHING") != nullptr; traceNothing) {
+                            static std::atomic<std::uint64_t> nothingCount{0};
+                            const auto n = nothingCount.fetch_add(1);
+                            if (n < 200 || n % 1000 == 0) std::fprintf(stderr, "[nothing] #%llu %s queue 0x%x mask 0x%x DB_DEPTH_CONTROL 0x%x DB_Z_INFO 0x%x DB_STENCIL_INFO 0x%x PS 0x%x zbase 0x%x\n", static_cast<unsigned long long>(n), Pm4::Name(header).c_str(), submission.queue, readRegister(queue.context, 0x8e), readRegister(queue.context, 0x200), readRegister(queue.context, 0x010), readRegister(queue.context, 0x011), readRegister(queue.shader, 0x8), readRegister(queue.context, 0x012));
+                        }
                     } else if (traceDraws) {
                         std::fprintf(stderr, "[draw] target 0x%llx mask 0x%x ok\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e));
                     }

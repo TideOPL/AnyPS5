@@ -26,6 +26,7 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <map>
 #include <limits>
 #include <exception>
@@ -1439,13 +1440,36 @@ bool StorageTexture::Refresh() {
 }
 
 DccKeys StorageTexture::ProvedKeys() const {
+    // DBG_KEYS_TRACE=<hex guest bytes>: for storage images of that size, print the keys each lookup proves and whether a GPU write over them was pending.
+    static const std::uint64_t traceBytes = std::getenv("DBG_KEYS_TRACE") ? std::strtoull(std::getenv("DBG_KEYS_TRACE"), nullptr, 16) : 0;
+    const bool trace = traceBytes != 0 && guestBytes == traceBytes && descriptor.dccAddress != 0;
+    bool pendingBefore = false;
+    if (trace) {
+        auto* recorder = Recorder::Active();
+        pendingBefore = recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->PendingWriteOverlaps(descriptor.dccAddress, static_cast<std::size_t>(guestBytes / 256u));
+    }
     if (descriptor.dccAddress != 0 && uploadedKeys == DccKeys::Uncompressed) {
         if (const auto keys = WaitForKeyWriters(descriptor, guestBytes)) {
             keyProof = {};
+            if (trace) std::fprintf(stderr, "[keys] 0x%llx dcc 0x%llx uploaded %s pending %d -> waited %s\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(descriptor.dccAddress), DccKeysName(uploadedKeys), pendingBefore, DccKeysName(*keys));
             return *keys;
         }
     }
-    return ProvedClearKeys(descriptor, guestBytes, keyProof);
+    const auto keys = ProvedClearKeys(descriptor, guestBytes, keyProof);
+    if (trace) {
+        auto* recorder = Recorder::Active();
+        const auto count = static_cast<std::size_t>(guestBytes / 256u);
+        const bool pendingAfter = recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->PendingWriteOverlaps(descriptor.dccAddress, count);
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(descriptor.dccAddress);
+        std::size_t zero = 0, ff = 0, firstOther = count;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (bytes[i] == 0) ++zero;
+            else if (bytes[i] == 0xff) ++ff;
+            else if (firstOther == count) firstOther = i;
+        }
+        std::fprintf(stderr, "[keys] 0x%llx fmt %u dcc 0x%llx uploaded %s pending %d->%d -> %s (keys %zu: 00 x%zu ff x%zu other@%zu)\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.format, static_cast<unsigned long long>(descriptor.dccAddress), DccKeysName(uploadedKeys), pendingBefore, pendingAfter, DccKeysName(keys), count, zero, ff, firstOther);
+    }
+    return keys;
 }
 
 bool StorageTexture::ServesKeysAt(std::uint64_t dccAddress) const {
@@ -2253,7 +2277,31 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         }
         if (superseded) source->reconcilePending();
     }
-    if (eager) {
+    // DBG_EAGER_MASK=<hex mask>:<hex value>: eager write-back only for images whose shape hash matches; DBG_EAGER_LOG=1 lists hashes.
+    static const char* eagerMask = std::getenv("DBG_EAGER_MASK");
+    static const bool eagerLog = std::getenv("DBG_EAGER_LOG") != nullptr;
+    bool selected = false;
+    if (eagerMask != nullptr || eagerLog) {
+        std::uint32_t hash = 2166136261u;
+        for (const std::uint32_t word : {descriptor.width, descriptor.height, descriptor.format, descriptor.mipCount, arrayLayers, descriptor.dccAddress != 0 ? 1u : 0u}) {
+            for (int b = 0; b < 4; ++b) hash = (hash ^ ((word >> (b * 8)) & 0xffu)) * 16777619u;
+        }
+        if (eagerLog) {
+            static std::mutex logMutex;
+            static std::set<std::uint32_t> seen;
+            std::lock_guard logLock(logMutex);
+            if (seen.insert(hash).second) std::fprintf(stderr, "[eager] hash %08x %ux%u fmt %u mips %u layers %u dcc %d\n", hash, descriptor.width, descriptor.height, descriptor.format, descriptor.mipCount, arrayLayers, descriptor.dccAddress != 0);
+        }
+        if (eagerMask != nullptr) {
+            unsigned mask = 0, value = 0;
+            std::sscanf(eagerMask, "%x:%x", &mask, &value);
+            selected = (hash & mask) == value;
+            static const std::uint64_t addrMin = std::getenv("DBG_EAGER_ADDR_MIN") ? std::strtoull(std::getenv("DBG_EAGER_ADDR_MIN"), nullptr, 16) : 0;
+            static const std::uint64_t addrMax = std::getenv("DBG_EAGER_ADDR_MAX") ? std::strtoull(std::getenv("DBG_EAGER_ADDR_MAX"), nullptr, 16) : ~0ull;
+            if (descriptor.baseAddress < addrMin || descriptor.baseAddress >= addrMax) selected = false;
+        }
+    }
+    if (eager || selected) {
         WriteBack();
         return;
     }
@@ -3368,10 +3416,21 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
             coalescedWriteBacks.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    if (static const bool traceR32 = std::getenv("DBG_TRACE_R32") != nullptr; traceR32 && descriptor.format == 22u && descriptor.width == 2848u && descriptor.baseAddress < 0x3100000000ull) {
+        std::size_t stored = 0;
+        for (const bool layer : layers) stored += layer ? 1 : 0;
+        std::fprintf(stderr, "[r32] write-back 0x%llx for %s 0x%llx+0x%zx: units %zu of %zu pending (%u tracked), whole %d, keys %s, memory changed since %d\n", static_cast<unsigned long long>(descriptor.baseAddress), flushReason != nullptr ? flushReason : "?", static_cast<unsigned long long>(address), bytes, stored, pendingCount, trackedLayers, whole, DccKeysName(uploadedKeys), !GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation));
+    }
     writeBackLayers(layers);
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    // DBG_SKIP_STALE_KEY_STORE=1: the write-back stores no uncompressed keys over a key range written since the image's generation.
+    static const bool dbgSkipStaleKeys = std::getenv("DBG_SKIP_STALE_KEY_STORE") != nullptr;
+    const std::uint64_t dbgKeysGeneration = generation;
+    const bool dbgKeysStale = dbgSkipStaleKeys && descriptor.dccAddress != 0 && dbgKeysGeneration != 0 && !GuestMemory::UnchangedSince(descriptor.dccAddress, static_cast<std::size_t>(guestBytes / 256u), dbgKeysGeneration);
+    static std::atomic<int> dbgStaleReports{0};
+    if (dbgKeysStale && dbgStaleReports.fetch_add(1) < 20) std::fprintf(stderr, "[keys] write-back of 0x%llx %ux%u fmt %u skips its key store: keys 0x%llx written since generation %llu\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.format, static_cast<unsigned long long>(descriptor.dccAddress), static_cast<unsigned long long>(dbgKeysGeneration));
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -3496,7 +3555,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             if (profile) Profile().storageGpu += timer.lap();
             originalValid = false;
             traceKeyStore("block write-back", descriptor, guestBytes);
-            if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+            if (!IsDccClear(filledKeys) && !dbgKeysStale) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
             uploadedKeys = DccKeys::Uncompressed;
             for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
             settle(true);
@@ -3604,7 +3663,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // metadata is host-imported (no CPU wait for the title's key-writing kernels), else a CPU
         // store (APS5_CPU_DCC_KEYS=1 keeps the CPU store; see DccMetadata.hpp).
         traceKeyStore("layer write-back", descriptor, guestBytes);
-        if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+        if (!IsDccClear(filledKeys) && !dbgKeysStale) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
         uploadedKeys = DccKeys::Uncompressed;
         for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
         // The walk covers this surface's pages only: an adjacent image's later CPU write is stamped
@@ -3642,6 +3701,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // Start from the uploaded bytes so padding and untouched texels keep their guest values.
     std::memcpy(host.Bytes().data(), original.data(), original.size());
     if (profile) Profile().storageHostCopy += timer.lap();
+    static const bool dbgSyncCpuWriteBack = std::getenv("DBG_SYNC_CPU_WRITEBACK") != nullptr;
+    if (dbgSyncCpuWriteBack) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Sync();
+    }
+    static std::atomic<int> dbgCpuWriteBackReports{0};
+    if (std::getenv("DBG_TRACE_R32") != nullptr && dbgCpuWriteBackReports.fetch_add(1) < 40) std::fprintf(stderr, "[r32] cpu write-back 0x%llx %ux%u fmt %u (recorder open %d)\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.format, Recorder::Active() != nullptr && Recorder::Active()->Recording());
     detiler.BeginBatch();
     CommandBatch batch(context);
     const auto commands = batch.Handle();
@@ -3714,7 +3779,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // The texels now hold the whole image, so later reads must see them rather than a fast clear
     // (the keys may be host-imported although the texels were not: then a recorded fill, else a CPU store).
     traceKeyStore("cpu write-back", descriptor, guestBytes);
-    if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+    if (!IsDccClear(filledKeys) && !dbgKeysStale) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
     uploadedKeys = DccKeys::Uncompressed;
     // The store above is the only write to these pages, so `original` is current at a fresh
     // generation, unless blocks were kept for the CPU: then the image is stale there.
@@ -3773,6 +3838,21 @@ std::uint64_t StorageTexture::GuestBytes() const {
 
 VkImageView StorageTexture::View() const {
     return view;
+}
+
+}
+
+namespace AgcDriver::Graphics {
+
+const StorageTexture* StorageTexture::DbgPendingOverlap(std::uint64_t begin, std::uint64_t end, std::uint32_t format, std::uint32_t width) {
+    if (end <= begin) return nullptr;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    for (const auto* texture : pending.textures) {
+        if (texture->descriptor.format == format && texture->descriptor.width == width && texture->overlaps(begin, bytes) && texture->pendingUnitInside(begin, bytes)) return texture;
+    }
+    return nullptr;
 }
 
 }

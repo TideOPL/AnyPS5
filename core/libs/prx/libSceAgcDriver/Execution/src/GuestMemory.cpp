@@ -1412,9 +1412,11 @@ const void* ThreadToken() {
 }
 }
 
+std::atomic<std::uint32_t>& DbgHolderTag() { static std::atomic<std::uint32_t> tag{0}; return tag; }
+
 void GpuMutexType::acquired() {
     owner.store(ThreadToken(), std::memory_order_relaxed);
-    ++depth;
+    if (++depth == 1) DbgHolderTag().store(LockStats().holderColumn == PresenterColumn ? 0xfffffffeu : LockStats().tag, std::memory_order_relaxed);
 }
 
 bool GpuMutexType::try_lock() {

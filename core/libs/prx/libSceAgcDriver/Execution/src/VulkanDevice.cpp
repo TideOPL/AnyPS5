@@ -33,6 +33,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <mutex>
+#include <set>
+#include "prx/libSceAgcDriver/Graphics/include/PassTrace.hpp"
 #include <SDL_loadso.h>
 #include <SDL_error.h>
 #include <spirv/unified1/spirv.hpp>
@@ -2619,6 +2621,37 @@ bool SyncEachDispatch() {
     return syncEachDispatch;
 }
 
+// DBG_SYNC_DISPATCH_MASK=<hex mask>:<hex value>: wait only for dispatches whose program code hash (FNV-1a of the
+// first 64 code bytes) matches (hash & mask) == value. DBG_SYNC_DISPATCH_LOG=1 prints each new hash once.
+std::uint32_t DbgProgramHash(std::uint64_t programAddress) {
+    if (programAddress == 0) return 0;
+    std::uint32_t hash = 2166136261u;
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(programAddress);
+    for (std::size_t i = 0; i < 64; ++i) hash = (hash ^ bytes[i]) * 16777619u;
+    return hash;
+}
+
+bool SyncThisDispatch(std::uint64_t programAddress, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+    if (SyncEachDispatch()) return true;
+    static const char* text = std::getenv("DBG_SYNC_DISPATCH_MASK");
+    static const bool log = std::getenv("DBG_SYNC_DISPATCH_LOG") != nullptr;
+    if (text == nullptr && !log) return false;
+    const auto hash = DbgProgramHash(programAddress);
+    if (log) {
+        static std::mutex mutex;
+        static std::set<std::uint32_t> seen;
+        std::lock_guard lock(mutex);
+        if (seen.insert(hash).second) std::fprintf(stderr, "[syncdisp] hash %08x program 0x%llx groups %ux%ux%u queue 0x%x\n", hash, static_cast<unsigned long long>(programAddress), x, y, z, Graphics::DbgCurrentQueue());
+    }
+    if (text == nullptr) return false;
+    static const std::pair<std::uint32_t, std::uint32_t> rule = [] {
+        unsigned mask = 0, value = 0;
+        std::sscanf(std::getenv("DBG_SYNC_DISPATCH_MASK"), "%x:%x", &mask, &value);
+        return std::pair<std::uint32_t, std::uint32_t>{mask, value};
+    }();
+    return (hash & rule.first) == rule.second;
+}
+
 // Debug aid: APS5_TRACE_DISPATCH_IO prints every dispatch's resources (after write-back when synced).
 bool TraceDispatchIo() {
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
@@ -3209,6 +3242,37 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         const auto bytes = static_cast<std::size_t>(end - begin);
         return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
     };
+    if (static const std::uint64_t traceBytes = std::getenv("DBG_KEYS_TRACE_WRITE") ? std::strtoull(std::getenv("DBG_KEYS_TRACE_WRITE"), nullptr, 16) : 0; traceBytes != 0) {
+        for (const auto& [begin, end] : resources.GpuWrites()) {
+            if (end - begin != traceBytes) continue;
+            std::fprintf(stderr, "[keys] dispatch writes 0x%llx+0x%llx: pending storage over it %d, pending write over it %d, copied writer over it %d, recorder completions %d, shadowed %d\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), Graphics::PendingStorageOverlaps(begin, static_cast<std::size_t>(end - begin), nullptr), recorder.PendingWriteOverlaps(begin, static_cast<std::size_t>(end - begin)), state->CopiedWriterOverlaps(begin, static_cast<std::size_t>(end - begin)), recorder.HasCompletions(), Graphics::AnyShadowedOverlaps(begin, static_cast<std::size_t>(end - begin)));
+            {
+                std::array<Graphics::StorageTexture::PendingQuery, 1> query{{{begin, end, nullptr, nullptr, false}}};
+                Graphics::StorageTexture::ScanPending(query);
+                if (const auto* image = query[0].found) std::fprintf(stderr, "[keys]   pending image 0x%llx+0x%llx %ux%u fmt %u dcc 0x%llx\n", static_cast<unsigned long long>(image->Descriptor().baseAddress), static_cast<unsigned long long>(image->GuestBytes()), image->Descriptor().width, image->Descriptor().height, image->Descriptor().format, static_cast<unsigned long long>(image->Descriptor().dccAddress));
+            }
+        }
+    }
+    if (static const bool traceR32 = std::getenv("DBG_TRACE_R32") != nullptr; traceR32) {
+        const auto check = [&](const char* kind, std::uint64_t begin, std::uint64_t end) {
+            const auto* image = Graphics::StorageTexture::DbgPendingOverlap(begin, end, 22u, 2848u);
+            if (image == nullptr) return;
+            std::fprintf(stderr, "[r32] dispatch %s 0x%llx+0x%llx over pending R32F 0x%llx (program hash %08x groups %ux%ux%u queue 0x%x)\n", kind, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(image->Descriptor().baseAddress), DbgProgramHash(record.programAddress), record.x, record.y, record.z, Graphics::DbgCurrentQueue());
+        };
+        for (const auto& [begin, end] : resources.InPlaceReads()) check("reads", begin, end);
+        for (const auto& [begin, end] : resources.GpuWrites()) check("writes", begin, end);
+    }
+    if (static const bool flushWritten = std::getenv("DBG_FLUSH_PENDING_UNDER_WRITES") != nullptr; flushWritten) {
+        for (const auto& [begin, end] : resources.GpuWrites()) {
+            const auto bytes = static_cast<std::size_t>(end - begin);
+            std::array<Graphics::StorageTexture::PendingQuery, 1> query{{{begin, end, nullptr, nullptr, false}}};
+            Graphics::StorageTexture::ScanPending(query);
+            if (!query[0].overlaps) continue;
+            const auto* image = query[0].found;
+            const bool flushed = Graphics::StorageTexture::FlushPending(begin, bytes, nullptr, "dispatch write");
+            std::fprintf(stderr, "[flushw] write 0x%llx+0x%zx over pending image 0x%llx+0x%llx %ux%u fmt %u: flushed %d, still pending %d\n", static_cast<unsigned long long>(begin), bytes, image ? static_cast<unsigned long long>(image->Descriptor().baseAddress) : 0ull, image ? static_cast<unsigned long long>(image->GuestBytes()) : 0ull, image ? image->Descriptor().width : 0u, image ? image->Descriptor().height : 0u, image ? image->Descriptor().format : 0u, flushed, Graphics::PendingStorageOverlaps(begin, bytes, nullptr));
+        }
+    }
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     VkAccessFlags covered = 0;
@@ -3524,7 +3588,12 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // when the batch finished (deferred lease release, see Graphics::SyncLeaseWork): a guest thread
     // that needs a leased allocation syncs the recorder itself through the registry's pin waiter.
     // APS5_SYNC_LEASE_DISPATCH=1 completes such dispatches at once, as before.
-    if (SyncEachDispatch() || (resources->HoldsLease() && Graphics::SyncLeaseWork())) {
+    // DBG_SYNC_DISPATCH_SUBMIT_ONLY=1: a selected dispatch only submits its batch instead of waiting for it.
+    static const bool submitOnly = std::getenv("DBG_SYNC_DISPATCH_SUBMIT_ONLY") != nullptr;
+    const bool selectedSync = SyncThisDispatch(programAddress, x, y, z);
+    if (selectedSync && submitOnly) {
+        recorder.Submit();
+    } else if (selectedSync || (resources->HoldsLease() && Graphics::SyncLeaseWork())) {
         Graphics::Recorder::CountSync(3);
         const auto syncStart = std::chrono::steady_clock::now();
         recorder.Sync();
@@ -3561,6 +3630,11 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
     }
     if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
+    if (static const std::uint32_t nanProbe = std::getenv("DBG_NAN_PROBE") ? static_cast<std::uint32_t>(std::strtoul(std::getenv("DBG_NAN_PROBE"), nullptr, 16)) : 0u; nanProbe != 0 && DbgProgramHash(programAddress) == nanProbe) {
+        auto ranges = resources->DbgWrittenStorageRanges();
+        for (const auto& range : resources->GpuWrites()) ranges.push_back(range);
+        Graphics::DbgNanProbeRanges() = std::move(ranges);
+    }
     WatchMemory(programAddress);
     // The recipe for the caller's dispatch-cache variant (design_cpu_final M4, rule R3): only an
     // object the resource cache serves under this content key (reusable: no lease, no copied
@@ -3692,7 +3766,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     counters.hits.fetch_add(1, std::memory_order_relaxed);
     if (record.dataRefresh != RecordedDispatch::DataRefresh::None) (record.refreshed ? counters.dataRefreshed : counters.dataSkipped).fetch_add(1, std::memory_order_relaxed);
     APS5_LOG_OUT_DEBUG("Dispatch recorded from recipe groups=%s", groupsText);
-    if (SyncEachDispatch()) {
+    if (SyncThisDispatch(programAddress, x, y, z)) {
         Graphics::Recorder::CountSync(3);
         state->recorder->Sync();
         timer.phase(PhaseSync);

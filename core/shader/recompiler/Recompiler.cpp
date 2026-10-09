@@ -80,6 +80,13 @@ std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
         char address[32];
         std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(request.shader.codeAddress));
         if (list.find(address) != std::string::npos) return 64u;
+        if (request.shader.code.size() >= 16) {
+            std::uint32_t hash = 2166136261u;
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(request.shader.code.data());
+            for (std::size_t i = 0; i < 64; ++i) hash = (hash ^ bytes[i]) * 16777619u;
+            std::snprintf(address, sizeof(address), "h%08x", hash);
+            if (list.find(address) != std::string::npos) return 64u;
+        }
     }
     return request.target.subgroupSize;
 }

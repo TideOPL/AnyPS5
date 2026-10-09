@@ -152,6 +152,8 @@ public:
     // overlapping pending image, as before).
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr);
     static void FlushAllPending(const char* reason);
+    // DBG: the first pending image overlapping [begin, end) with a pending unit inside it whose format and width match.
+    static const StorageTexture* DbgPendingOverlap(std::uint64_t begin, std::uint64_t end, std::uint32_t format, std::uint32_t width);
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
     static void BumpPendingSerial();

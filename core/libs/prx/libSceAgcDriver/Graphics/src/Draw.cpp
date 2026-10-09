@@ -889,6 +889,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
         Require(highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         Require(!state.stages.mesh || state.stages.mesh->inputPrimitive != 5 || !state.primitiveRestart || highest != (draw.indexSize == 2 ? 0xffffu : 0xffffffffu), "primitive restart in a triangle fan geometry draw is unsupported");
+        if (static const std::uint32_t traceIb = std::getenv("DBG_TRACE_VB") ? static_cast<std::uint32_t>(std::strtoul(std::getenv("DBG_TRACE_VB"), nullptr, 10)) : 0u; traceIb != 0 && draw.indexCount == traceIb) {
+            static std::atomic<int> printed{0};
+            if (printed.fetch_add(1) < 60) {
+                const auto* words = reinterpret_cast<const std::uint32_t*>(copy.buffer->Bytes().data());
+                const auto* live = reinterpret_cast<const std::uint32_t*>(draw.indexAddress);
+                std::string text;
+                char item[48];
+                for (std::size_t w = 0; words != nullptr && w < std::min<std::size_t>(indexBytes / 4, 4); ++w) { std::snprintf(item, sizeof(item), " %08x/%08x", words[w], live[w]); text += item; }
+                const bool same = words != nullptr && std::memcmp(words, live, static_cast<std::size_t>(indexBytes)) == 0;
+                std::fprintf(stderr, "[ib] n%u size %u indirect %d depthWrite %d colors %zu addr 0x%llx reused %d gen %llu highest %u copy==live %d copy/live:%s\n", draw.indexCount, draw.indexSize, args != nullptr, state.depthWrite, state.colors.size(), static_cast<unsigned long long>(draw.indexAddress), copy.reused, static_cast<unsigned long long>(copy.generation), highest, same, text.c_str());
+            }
+        }
         inputs.maxIndex = highest;
         inputs.indices = std::move(copy.buffer);
     }
@@ -928,6 +940,19 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
+        // DBG_TRACE_VB=<index count>: each vertex copy of draws with that index count (40 lines), with its first dwords.
+        if (static const std::uint32_t traceVb = std::getenv("DBG_TRACE_VB") ? static_cast<std::uint32_t>(std::strtoul(std::getenv("DBG_TRACE_VB"), nullptr, 10)) : 0u; traceVb != 0 && draw.indexCount == traceVb) {
+            static std::atomic<int> printed{0};
+            if (printed.fetch_add(1) < 40) {
+                const auto* words = reinterpret_cast<const std::uint32_t*>(inputs.vertexBuffers.back()->Bytes().data());
+                const auto* live = reinterpret_cast<const std::uint32_t*>(begin);
+                const auto count = words == nullptr ? 0 : std::min<std::size_t>(bytes / 4, 4);
+                std::string text;
+                char item[48];
+                for (std::size_t w = 0; w < count; ++w) { std::snprintf(item, sizeof(item), " %08x/%08x", words[w], live[w]); text += item; }
+                std::fprintf(stderr, "[vb] n%u indirect %d depthWrite %d copy 0x%llx+0x%zx reused %d gen %llu copy/live:%s\n", draw.indexCount, args != nullptr, state.depthWrite, static_cast<unsigned long long>(begin), bytes, copy.reused, static_cast<unsigned long long>(copy.generation), text.c_str());
+            }
+        }
     }
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         if (outOfRange[i] != nullptr) {
@@ -1161,7 +1186,20 @@ std::shared_ptr<Buffer> recordMeshArguments(const Context& context, VkCommandBuf
 // Debug aid: APS5_CHECK_INDIRECT_ARGS=1 reads the records of a GPU-side draw back on the CPU once
 // its batch completed (the GPU has finished writing them by then) and prints the first 16, counting
 // records whose Constant dimension holds a value the hardware would have ignored. Empty otherwise.
-std::function<void()> indirectRecordCheck(const IndirectRecord* indirect) {
+std::function<void()> indirectRecordCheck(const IndirectRecord* indirect, const State& state, std::uint32_t indexCount) {
+    // DBG_INDIRECT_LOG=1: within the pass trace window, every indirect draw's records as executed, with the pass shape.
+    if (static const bool log = std::getenv("DBG_INDIRECT_LOG") != nullptr; log && indirect != nullptr && indirect->args != nullptr && PassTraceActive()) {
+        const auto colors = state.colors.size();
+        const bool depthWrite = state.depthWrite;
+        const auto depth = state.depth ? state.depth->address : 0ull;
+        const auto path = static_cast<int>(indirect->path);
+        return [args = *indirect->args, colors, depthWrite, depth, path, indexCount] {
+            for (std::uint32_t record = 0; record < args.count; ++record) {
+                const auto a = Pm4::ReadDrawArguments(args, record);
+                std::fprintf(stderr, "[indlog] colors %zu depthWrite %d depth 0x%llx path %d indexCount %u args 0x%llx rec %u: count %u instances %u first %u vertexOffset %u startInstance %u rules %d/%d const %u/%u\n", colors, depthWrite, static_cast<unsigned long long>(depth), path, indexCount, static_cast<unsigned long long>(args.arguments + static_cast<std::uint64_t>(record) * args.stride), record, a.count, a.instances, a.firstVertexOrIndex, a.vertexOffset, a.firstInstance, static_cast<int>(args.vertexRule), static_cast<int>(args.instanceRule), args.vertexConstant, args.instanceConstant);
+            }
+        };
+    }
     static const bool checkArguments = std::getenv("APS5_CHECK_INDIRECT_ARGS") != nullptr;
     if (indirect == nullptr || indirect->args == nullptr || indirect->path != IndirectDrawPath::Gpu || !checkArguments) return {};
     return [args = *indirect->args] {
@@ -1457,7 +1495,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
-    auto checkRecords = indirectRecordCheck(record.indirect);
+    auto checkRecords = indirectRecordCheck(record.indirect, state, draw.indexCount);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
     // The pass stays open for the next draw of these attachments; the recorder ends it (and the
     // draw class range) before anything else is recorded. A draw that wrote memory owes the next
@@ -1538,6 +1576,40 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
     PerformanceTimer timing("Graphics.Draw");
+    // DBG_SKIP_PREPASS_COUNTS=<n>,<n>...: depth-writing draws without color targets whose index count is listed are skipped.
+    // DBG_SKIP_BASE_COUNTS=<n>,...: the same for draws into four or more color targets.
+    {
+        static const auto parse = [](const char* name) {
+            std::set<std::uint32_t> counts;
+            if (const char* text = std::getenv(name)) {
+                for (const char* at = text; *at != '\0';) {
+                    char* end = nullptr;
+                    counts.insert(static_cast<std::uint32_t>(std::strtoul(at, &end, 10)));
+                    if (end == at) break;
+                    at = *end == ',' ? end + 1 : end;
+                }
+            }
+            return counts;
+        };
+        static const auto prepassSkips = parse("DBG_SKIP_PREPASS_COUNTS");
+        static const auto baseSkips = parse("DBG_SKIP_BASE_COUNTS");
+        if (!prepassSkips.empty() && state.colors.empty() && state.depthWrite && prepassSkips.contains(draw.indexCount)) return;
+        if (!baseSkips.empty() && state.colors.size() >= 4 && baseSkips.contains(draw.indexCount)) return;
+        // DBG_FORCE_DEPTH_WRITE_COUNT=<n>: draws into four or more color targets with that index count write depth with an ALWAYS test.
+        static const std::uint32_t forceCount = std::getenv("DBG_FORCE_DEPTH_WRITE_COUNT") ? static_cast<std::uint32_t>(std::strtoul(std::getenv("DBG_FORCE_DEPTH_WRITE_COUNT"), nullptr, 10)) : 0u;
+        if (forceCount != 0 && draw.indexCount == forceCount && state.colors.size() >= 4 && state.depth) {
+            auto& forced = const_cast<State&>(state);
+            forced.depthTest = true;
+            forced.depthWrite = true;
+            forced.depthCompare = VK_COMPARE_OP_ALWAYS;
+        }
+        // DBG_TRACE_COUNT=<n>: the depth state of every draw with that index count (at most 40 lines).
+        static const std::uint32_t traceCount = std::getenv("DBG_TRACE_COUNT") ? static_cast<std::uint32_t>(std::strtoul(std::getenv("DBG_TRACE_COUNT"), nullptr, 10)) : 0u;
+        static std::atomic<int> traced{0};
+        if (traceCount != 0 && draw.indexCount == traceCount && traced.fetch_add(1) < 40) {
+            std::fprintf(stderr, "[count] n%u inst %u indirect %d colors %zu depth 0x%llx test %d write %d op %d bias %d (%g %g %g) clamp %d viewport %g,%g %gx%g z %g..%g cull %u front %u stencil %d prim %u\n", draw.indexCount, draw.instanceCount, draw.indirect.has_value(), state.colors.size(), state.depth ? static_cast<unsigned long long>(state.depth->address) : 0ull, state.depthTest, state.depthWrite, static_cast<int>(state.depthCompare), state.depthBias, state.depthBiasConstant, state.depthBiasSlope, state.depthBiasClamp, state.depthClamp, state.viewport.x, state.viewport.y, state.viewport.width, state.viewport.height, state.viewport.minDepth, state.viewport.maxDepth, static_cast<unsigned>(state.cullMode), static_cast<unsigned>(state.frontFace), state.stencilTest, static_cast<unsigned>(state.topology));
+        }
+    }
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawTimer timer(profile);
@@ -1667,6 +1739,31 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr; });
     auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
     auto& resources = resolved.resources;
+    if (static const std::uint32_t traceResources = std::getenv("DBG_TRACE_COUNT_RESOURCES") ? static_cast<std::uint32_t>(std::strtoul(std::getenv("DBG_TRACE_COUNT_RESOURCES"), nullptr, 10)) : 0u; traceResources != 0 && draw.indexCount == traceResources && resources != nullptr) {
+        static std::atomic<int> printed{0};
+        if (printed.fetch_add(1) < 12) {
+            std::string inPlace;
+            for (const auto& [begin, end] : resources->InPlaceReads()) {
+                char item[64];
+                std::snprintf(item, sizeof(item), " 0x%llx+0x%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+                inPlace += item;
+            }
+            {
+                std::lock_guard lock(DbgRecordedWritesMutex());
+                const auto now = DbgRecordSequence().load();
+                for (const auto& [begin, end] : resources->InPlaceReads()) {
+                    if (end - begin != 0x1204 && end - begin != 0x11f4 && end - begin != 0x30000) continue;
+                    const DbgRecordedWrite* last = nullptr;
+                    for (const auto& write : DbgRecordedWrites()) {
+                        if (write.begin < end && begin < write.end) last = &write;
+                    }
+                    if (last != nullptr) std::fprintf(stderr, "[countres]   read 0x%llx+0x%llx last written by queue 0x%x, %llu writes ago (0x%llx+0x%llx)\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), last->queue, static_cast<unsigned long long>(now - last->sequence), static_cast<unsigned long long>(last->begin), static_cast<unsigned long long>(last->end - last->begin));
+                    else std::fprintf(stderr, "[countres]   read 0x%llx+0x%llx: no recorded writer in the ring\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+                }
+            }
+            std::fprintf(stderr, "[countres] n%u colors %zu built %d cacheable %d in-place:%s | %s\n", draw.indexCount, state.colors.size(), resolved.built, resolved.cacheable, inPlace.c_str(), resources->Describe().c_str());
+        }
+    }
     const auto& contentKey = resolved.contentKey;
     const bool cacheable = resolved.cacheable;
     built = resolved.built;
@@ -2015,7 +2112,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
     if (meshArguments != nullptr && recorded) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(indirect.path, indirect.readMs, rewritten);
-    auto checkRecords = indirectRecordCheck(args != nullptr ? &indirect : nullptr);
+    auto checkRecords = indirectRecordCheck(args != nullptr ? &indirect : nullptr, state, draw.indexCount);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
     context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
     APS5_LOG_CHARS_OUT_DEBUG("Render pass ended");

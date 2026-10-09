@@ -2428,7 +2428,46 @@ bool Recorder::ReadTracking() {
     return ReadTrackingEnabled();
 }
 
+
+namespace {
+// DBG_RECORD_READ_CHECK=1: each noted in-place read keeps the memory generation at its note; at Submit a read whose
+// range was written since (by the CPU, or by a later driver store) is reported, as nothing has executed it yet.
+struct DbgNotedRead { std::uint64_t begin, end; int kind; std::uint64_t generation; };
+bool DbgRecordReadCheck() { static const bool enabled = std::getenv("DBG_RECORD_READ_CHECK") != nullptr; return enabled; }
+std::vector<DbgNotedRead>& DbgNotedReads() { static std::vector<DbgNotedRead> reads; return reads; }
+void DbgNoteRead(std::uint64_t begin, std::uint64_t end, int kind) {
+    if (!DbgRecordReadCheck() || end <= begin) return;
+    DbgNotedReads().push_back({begin, end, kind, GuestMemory::CollectWritesUncached(begin, static_cast<std::size_t>(end - begin))});
+}
+void DbgCheckReadsAtSubmit() {
+    if (!DbgRecordReadCheck()) return;
+    static std::map<std::pair<std::uint64_t, int>, std::uint64_t> hits;
+    static std::uint64_t checked = 0, overwritten = 0;
+    static auto lastReport = std::chrono::steady_clock::now();
+    for (const auto& read : DbgNotedReads()) {
+        ++checked;
+        GuestMemory::CollectWritesUncached(read.begin, static_cast<std::size_t>(read.end - read.begin));
+        if (GuestMemory::UnchangedSince(read.begin, static_cast<std::size_t>(read.end - read.begin), read.generation)) continue;
+        ++overwritten;
+        ++hits[{read.end - read.begin, read.kind}];
+    }
+    DbgNotedReads().clear();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(5)) return;
+    lastReport = now;
+    std::vector<std::pair<std::uint64_t, std::pair<std::uint64_t, int>>> top;
+    for (const auto& [key, count] : hits) top.push_back({count, key});
+    std::sort(top.rbegin(), top.rend());
+    std::string text;
+    char item[96];
+    for (std::size_t i = 0; i < top.size() && i < 12; ++i) { std::snprintf(item, sizeof(item), " %llux(%llu B kind %d)", static_cast<unsigned long long>(top[i].first), static_cast<unsigned long long>(top[i].second.first), top[i].second.second); text += item; }
+    std::fprintf(stderr, "[readcheck] %llu of %llu in-place reads written between record and submit; by size and kind:%s\n", static_cast<unsigned long long>(overwritten), static_cast<unsigned long long>(checked), text.c_str());
+    hits.clear();
+}
+}
+
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
+    DbgNoteRead(address, address + bytes, static_cast<int>(kind));
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
@@ -2442,6 +2481,7 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
     for (const auto& [begin, end] : ranges) {
         CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
         if (end > begin) open->reads.push_back({begin, end, kind});
+        DbgNoteRead(begin, end, static_cast<int>(kind));
     }
     readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
 }
@@ -2761,6 +2801,11 @@ bool Recorder::writtenBackSince(std::uint64_t sequence, std::uint64_t begin, std
     return false;
 }
 
+void Recorder::DbgFullBarrier() {
+    const auto commands = Commands();
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT);
+}
+
 void Recorder::Submit() {
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
@@ -2769,6 +2814,7 @@ void Recorder::Submit() {
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    DbgCheckReadsAtSubmit();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     endSamples(*open);

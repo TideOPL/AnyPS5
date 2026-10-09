@@ -14,11 +14,91 @@
 #include <stdexcept>
 #include <thread>
 #include "prx/libSceAgcDriver/Graphics/include/PassTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <mutex>
+#include <set>
 
 namespace AgcDriver::DriverDetail {
 
+int& DbgAfterHashPackets() { static thread_local int remaining = 0; return remaining; }
+
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
+    if (auto& probe = Graphics::DbgNanProbeRanges(); !probe.empty()) {
+        const auto ranges = std::move(probe);
+        probe.clear();
+        static std::atomic<int> printed{0};
+        static const auto probeStart = std::chrono::steady_clock::now();
+        static const double probeAfter = std::getenv("DBG_NAN_PROBE_S") ? std::atof(std::getenv("DBG_NAN_PROBE_S")) : 0.0;
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - probeStart).count() >= probeAfter) {
+            for (const auto& [begin, end] : ranges) {
+                const auto bytes = static_cast<std::size_t>(end - begin);
+                if (bytes == 0 || bytes > (64ull << 20u) || !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) continue;
+                {
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    Graphics::StorageTexture::FlushPending(begin, bytes, nullptr, "nan probe");
+                    if (auto* recorder = Graphics::Recorder::Active()) recorder->Sync();
+                }
+                GuestMemory::FlushGpuWrites(begin, bytes);
+                std::size_t half = 0, single = 0;
+                const auto* halves = reinterpret_cast<const std::uint16_t*>(begin);
+                for (std::size_t i = 0; i < bytes / 2; ++i) half += (halves[i] & 0x7c00u) == 0x7c00u;
+                const auto* singles = reinterpret_cast<const std::uint32_t*>(begin);
+                for (std::size_t i = 0; i < bytes / 4; ++i) single += (singles[i] & 0x7f800000u) == 0x7f800000u;
+                if (printed.fetch_add(1) < 400) std::fprintf(stderr, "[nan] 0x%llx+0x%zx fp16 non-finite %zu, fp32 non-finite %zu\n", static_cast<unsigned long long>(begin), bytes, half, single);
+            }
+        }
+    }
+    // DBG_AFTER_HASH=<hex program hash>: the next 40 packets of this queue after such a dispatch are logged ([after]), 3 times.
+    if (static const std::uint32_t afterHash = std::getenv("DBG_AFTER_HASH") ? static_cast<std::uint32_t>(std::strtoul(std::getenv("DBG_AFTER_HASH"), nullptr, 16)) : 0u; afterHash != 0 && address != 0) {
+        std::uint32_t hash = 2166136261u;
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(address);
+        for (std::size_t i = 0; i < 64; ++i) hash = (hash ^ bytes[i]) * 16777619u;
+        static std::atomic<int> times{0};
+        if (hash == afterHash && (std::getenv("DBG_AFTER_GROUPS") == nullptr || (packet.size() > 3 && packet[1] == std::strtoul(std::getenv("DBG_AFTER_GROUPS"), nullptr, 10))) && [] { static const auto start = std::chrono::steady_clock::now(); static const double after = std::getenv("DBG_AFTER_S") ? std::atof(std::getenv("DBG_AFTER_S")) : 0.0; return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= after; }() && times.fetch_add(1) < 3) {
+            DbgAfterHashPackets() = 120;
+            std::fprintf(stderr, "[after] dispatch %08x queue 0x%x groups %u %u %u indirect 0x%llx\n", hash, submission.queue, packet.size() > 3 ? packet[1] : 0u, packet.size() > 3 ? packet[2] : 0u, packet.size() > 3 ? packet[3] : 0u, static_cast<unsigned long long>(indirectArguments));
+        }
+    }
+    // DBG_PRESYNC_MASK=<hex mask>:<hex value>: before preparing a dispatch whose program hash (FNV-1a of 64 code bytes)
+    // matches, wait for every recorded batch. DBG_PRESYNC_LOG=1 prints each hash once with queue and groups.
+    if (static const char* presync = std::getenv("DBG_PRESYNC_MASK"); presync != nullptr || std::getenv("DBG_PRESYNC_LOG") != nullptr) {
+        std::uint32_t hash = 2166136261u;
+        if (address != 0) {
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(address);
+            for (std::size_t i = 0; i < 64; ++i) hash = (hash ^ bytes[i]) * 16777619u;
+        }
+        if (std::getenv("DBG_PRESYNC_LOG") != nullptr) {
+            static std::mutex logMutex;
+            static std::set<std::uint32_t> seen;
+            std::lock_guard logLock(logMutex);
+            if (seen.insert(hash).second) std::fprintf(stderr, "[presync] hash %08x program 0x%llx queue 0x%x indirect %d groups %ux%ux%u\n", hash, static_cast<unsigned long long>(address), submission.queue, indirectArguments != 0, packet.size() > 3 ? packet[1] : 0u, packet.size() > 3 ? packet[2] : 0u, packet.size() > 3 ? packet[3] : 0u);
+        }
+        if (presync != nullptr) {
+            static const std::pair<std::uint32_t, std::uint32_t> rule = [] {
+                unsigned mask = 0, value = 0;
+                std::sscanf(std::getenv("DBG_PRESYNC_MASK"), "%x:%x", &mask, &value);
+                return std::pair<std::uint32_t, std::uint32_t>{mask, value};
+            }();
+            const bool presyncMatch = (hash & rule.first) == rule.second && (std::getenv("DBG_PRESYNC_GROUPS") == nullptr || (packet.size() > 3 && std::strstr(std::getenv("DBG_PRESYNC_GROUPS"), ("," + std::to_string(packet[1]) + ",").c_str()) != nullptr));
+            static thread_local int presyncRun = 0;
+            presyncRun = presyncMatch ? presyncRun + 1 : 0;
+            static const int presyncIndex = std::getenv("DBG_PRESYNC_RUN_INDEX") ? std::atoi(std::getenv("DBG_PRESYNC_RUN_INDEX")) : 0;
+            if (presyncMatch && (presyncIndex == 0 || presyncRun == presyncIndex)) {
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                static const bool submitOnly = std::getenv("DBG_PRESYNC_SUBMIT_ONLY") != nullptr;
+                static const int storesOnly = std::getenv("DBG_PRESYNC_STORES_ONLY") ? std::atoi(std::getenv("DBG_PRESYNC_STORES_ONLY")) : 0;
+                if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr && storesOnly != 0) {
+                    if ((storesOnly & 1) != 0 && recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
+                    if ((storesOnly & 2) != 0 && recorder->HasQueuedStores()) recorder->FlushStores();
+                    if ((storesOnly & 4) != 0) recorder->DbgFullBarrier();
+                } else if (recorder != nullptr) {
+                    if (submitOnly) recorder->Submit();
+                    else recorder->Sync();
+                }
+            }
+        }
+    }
     auto it = submission.shaders->upper_bound(address);
     std::shared_ptr<const ShaderSnapshot> registeredShader;
     if (it != submission.shaders->begin()) {
@@ -37,6 +117,36 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::vector<ShaderRecompiler::MemoryRegion> memory{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}};
     if (!snapshot.header.empty()) memory.push_back({snapshot.headerAddress, snapshot.header});
 
+    // DBG_HOLDER_LOG=1: at each dispatch, whether another thread held GpuMutex and which (queue tag), every 10 s.
+    if (static const bool holderLog = std::getenv("DBG_HOLDER_LOG") != nullptr; holderLog) {
+        static std::mutex countsMutex;
+        static std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> counts;
+        static std::uint64_t checked = 0;
+        static auto lastReport = std::chrono::steady_clock::now();
+        auto& gpu = GuestMemory::GpuMutex();
+        std::uint32_t holder = 0;
+        bool busy = false;
+        if (!gpu.HeldByThisThread()) {
+            if (gpu.try_lock()) gpu.unlock();
+            else {
+                busy = true;
+                holder = GuestMemory::DbgHolderTag().load(std::memory_order_relaxed);
+            }
+        }
+        std::lock_guard lock(countsMutex);
+        ++checked;
+        if (busy) ++counts[{submission.queue, holder}];
+        if (std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(10)) {
+            lastReport = std::chrono::steady_clock::now();
+            std::string text;
+            char item[64];
+            for (const auto& [key, count] : counts) {
+                std::snprintf(item, sizeof(item), " q0x%x<-0x%x:%llu", key.first, key.second, static_cast<unsigned long long>(count));
+                text += item;
+            }
+            std::fprintf(stderr, "[holder] %llu dispatches, busy (dispatch queue<-holder tag):%s\n", static_cast<unsigned long long>(checked), text.c_str());
+        }
+    }
     static const bool unlockedDevice = std::getenv("APS5_UNLOCKED_DEVICE") != nullptr;
     std::shared_ptr<VulkanDevice> localDevice = unlockedDevice ? device.Load() : nullptr;
     if (localDevice == nullptr) {

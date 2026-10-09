@@ -93,6 +93,21 @@ inline void PassTraceNote(std::uint64_t address) {
     PassTraceAddresses().insert(address);
 }
 
+// DBG: a ring of the latest recorded GPU writes (MarkGpuWrites), with the queue that recorded them and a sequence number.
+struct DbgRecordedWrite { std::uint64_t begin, end; std::uint32_t queue; std::uint64_t sequence; };
+inline std::mutex& DbgRecordedWritesMutex() { static std::mutex mutex; return mutex; }
+inline std::vector<DbgRecordedWrite>& DbgRecordedWrites() { static std::vector<DbgRecordedWrite> writes; return writes; }
+inline std::atomic<std::uint64_t>& DbgRecordSequence() { static std::atomic<std::uint64_t> sequence{0}; return sequence; }
+inline void DbgNoteRecordedWrite(std::uint64_t begin, std::uint64_t end, std::uint32_t queue) {
+    std::lock_guard lock(DbgRecordedWritesMutex());
+    auto& writes = DbgRecordedWrites();
+    if (writes.size() >= 4096) writes.erase(writes.begin(), writes.begin() + 1024);
+    writes.push_back({begin, end, queue, ++DbgRecordSequence()});
+}
+
+// DBG_NAN_PROBE=<hex program hash>: the guest ranges such a dispatch wrote, scanned for non-finite values before the next dispatch.
+inline std::vector<std::pair<std::uint64_t, std::uint64_t>>& DbgNanProbeRanges() { static thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges; return ranges; }
+
 }
 
 #endif

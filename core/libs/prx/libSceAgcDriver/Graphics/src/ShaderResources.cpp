@@ -379,6 +379,12 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         keys.reset();
     }
     if (!keys.has_value()) keys = scanKeys();
+    if (static const bool traceR32 = std::getenv("DBG_TRACE_R32") != nullptr; traceR32) {
+        const auto* image = StorageTexture::DbgPendingOverlap(address, address + bytes, 22u, 2848u);
+        if (image != nullptr && image != source.get()) {
+            std::fprintf(stderr, "[r32] sample 0x%llx+0x%zx %ux%u fmt %u tile %u over pending R32F 0x%llx: source %s, clearThroughKeys %d, keys %s, depthCompare %d\n", static_cast<unsigned long long>(address), bytes, resource.width, resource.height, resource.format, static_cast<std::uint32_t>(resource.tileMode), static_cast<unsigned long long>(image->Descriptor().baseAddress), source == nullptr ? "none" : "other", clearThroughKeys, DccKeysName(*keys), depthCompare);
+        }
+    }
     if (disabled) {
         if (source != nullptr) return std::make_shared<Texture>(context, source, resource, components);
         std::vector<std::byte> snapshot(bytes);
@@ -3026,6 +3032,14 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes());
+    if (static const bool ring = std::getenv("DBG_TRACE_COUNT_RESOURCES") != nullptr; ring) {
+        for (const auto& [begin, end] : guestMemory.Writes()) DbgNoteRecordedWrite(begin, end, DbgCurrentQueue());
+    }
+    if (static const std::uint64_t traceBytes = std::getenv("DBG_KEYS_TRACE_WRITE") ? std::strtoull(std::getenv("DBG_KEYS_TRACE_WRITE"), nullptr, 16) : 0; traceBytes != 0) {
+        for (const auto& [begin, end] : guestMemory.Writes()) {
+            if (end - begin == traceBytes) std::fprintf(stderr, "[keys] noted write 0x%llx+0x%llx (pending now %d)\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), recorder.PendingWriteOverlaps(begin, static_cast<std::size_t>(end - begin)));
+        }
+    }
     guestMemory.MarkDirectWrites();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
@@ -3053,6 +3067,14 @@ bool ShaderResources::WritesMemory() const {
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
     const auto reads = guestMemory.InPlaceReads();
     return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::DbgWrittenStorageRanges() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (storageTextures[index] != nullptr && storageWritten[index]) ranges.emplace_back(storageTextures[index]->Descriptor().baseAddress, storageTextures[index]->Descriptor().baseAddress + storageTextures[index]->GuestBytes());
+    }
+    return ranges;
 }
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
