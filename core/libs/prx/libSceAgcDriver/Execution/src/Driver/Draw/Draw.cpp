@@ -38,7 +38,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     static const std::uint64_t dumpSlot1 = [] { const char* text = std::getenv("APS5_DUMP_DRAW_SLOT1"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
 
-    static const bool lockedPrepare = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
+    static const bool lockedPrepare = std::getenv("APS5_UNLOCKED_DRAW_PREPARE") == nullptr;
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
     std::shared_ptr<VulkanDevice> localDevice;
     if (lockedPrepare) {

@@ -37,7 +37,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::vector<ShaderRecompiler::MemoryRegion> memory{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}};
     if (!snapshot.header.empty()) memory.push_back({snapshot.headerAddress, snapshot.header});
 
-    static const bool unlockedDevice = std::getenv("APS5_NO_UNLOCKED_DEVICE") == nullptr;
+    static const bool unlockedDevice = std::getenv("APS5_UNLOCKED_DEVICE") != nullptr;
     std::shared_ptr<VulkanDevice> localDevice = unlockedDevice ? device.Load() : nullptr;
     if (localDevice == nullptr) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
