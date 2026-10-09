@@ -909,7 +909,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     std::vector<std::shared_ptr<Buffer>> outOfRange(attributes.size());
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
-        if (args == nullptr && VertexFetchPastRawRange(attribute)) {
+        if (VertexFetchPastRawRange(attribute)) {
             outOfRange[i] = outOfRangeVertexBuffer(context, attribute);
             continue;
         }
